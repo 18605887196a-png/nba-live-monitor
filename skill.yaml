@@ -1,0 +1,5 @@
+name: "nba_live_monitor"
+title: "NBA 滚球盘口监控"
+description: "用户给一场 NBA 比赛后，实时监控 Polymarket 滚球胜负盘与比分，用胜率模型识别盘口错价并分阶段汇报机会、第三节快照和终场结果。"
+category: "Finance and investing"
+include_in_prompt: true
