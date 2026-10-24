@@ -13,10 +13,44 @@ Model (per team): WP = Phi((lead + M * t/48) / (13 * sqrt(t/48)))
 """
 import argparse, json, math, sys, time, urllib.request
 
-def fetch(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "nba-monitor/1.0"})
-    with urllib.request.urlopen(req, timeout=12) as r:
-        return json.load(r)
+def espn_event(event_id):
+    # scoreboard first; falls back to summary endpoint when scoreboard
+    # throws its usual post-tipoff IncompleteRead streak.
+    last = None
+    urls = [
+        "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+        f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event={event_id}",
+    ]
+    for url in urls:
+        try:
+            data = fetch(url)
+            if "header" in data:  # summary shape
+                comp = data["header"]["competitions"][0]
+                ev_status, ev_comp = comp.get("status", {}), comp
+            else:  # scoreboard shape
+                ev = next((e for e in data.get("events", []) if str(e.get("id")) == str(event_id)), None)
+                if ev is None:
+                    last = Exception("event not found on scoreboard")
+                    continue
+                ev_status, ev_comp = ev.get("status", {}), ev.get("competitions", [{}])[0]
+            return ev_status, ev_comp
+        except Exception as e:
+            last = e
+    raise last
+
+def fetch(url, tries=3, interval=2.0, timeout=15):
+    # ESPN scoreboard throws IncompleteRead right after tipoff; retry before giving up.
+    last = None
+    for i in range(tries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "nba-monitor/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(interval)
+    raise last
 
 def phi(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -72,15 +106,11 @@ def main():
     while True:
         polls += 1
         try:
-            sb = fetch("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard")
-            ev = next((e for e in sb.get("events", []) if str(e.get("id")) == str(args.event_id)), None)
-            if ev is None:
-                emit("POLL", {"note": "event not found"}); time.sleep(args.poll); continue
-            st = ev.get("status", {})
+            st, comp0 = espn_event(args.event_id)
             period = st.get("period", 0)
             clock = st.get("displayClock", "0.0")
             completed = bool(st.get("type", {}).get("completed"))
-            comp = ev.get("competitions", [{}])[0].get("competitors", [])
+            comp = comp0.get("competitors", [])
             teams = {}
             order = []
             for c in comp:
@@ -147,6 +177,18 @@ def main():
                         trig = {"side": teams[ha]["name"], "ha": ha, "ask": ask, "bid": bid,
                                 "wp": round(wp[ha], 3), "edge_pp": round(edge * 100, 1)}
                         row["streak"] = dict(streak)
+            def mkt_quotes(q):
+                # bestBid/bestAsk per outcome index (index 1 mirrored as 1-ask / 1-bid);
+                # outcomePrices is lagging last-trade, never use it for order reference.
+                m = markets.get(q, {}) or {}
+                bb, ba = m.get("bestBid"), m.get("bestAsk")
+                if bb is None or ba is None:
+                    return None
+                bb, ba = float(bb), float(ba)
+                return [{"bid": round(bb, 3), "ask": round(ba, 3)},
+                        {"bid": round(1 - ba, 3), "ask": round(1 - bb, 3)}]
+            row["spread_quotes"] = mkt_quotes(args.spread_question) if args.spread_question else None
+            row["total_quotes"] = mkt_quotes(args.total_question) if args.total_question else None
             row["spread_mkt"] = (markets.get(args.spread_question, {}) or {}).get("outcomePrices") if args.spread_question else None
             row["total_mkt"] = (markets.get(args.total_question, {}) or {}).get("outcomePrices") if args.total_question else None
             row["total_pts"] = home.get("score", 0) + away.get("score", 0)
@@ -157,7 +199,9 @@ def main():
             if trig:
                 emit("TRIGGER", {"trigger": trig, "period": period, "clock": clock,
                                  "score": f"{away.get('name')} {away.get('score')} : {home.get('score')} {home.get('name')}"})
-                if args.mode in ("trigger", "q3"):
+                # trigger is data-log only; only mode=trigger exits on it (2026-10-24 fix:
+                # q3 mode used to exit on trigger and never emit Q3_SNAPSHOT)
+                if args.mode == "trigger":
                     return 0
             if args.mode == "q3" and period >= 4:
                 emit("Q3_SNAPSHOT", row)
