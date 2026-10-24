@@ -53,7 +53,11 @@ def fmt_price(p):
 
 def analyze(gid, slug, hm, state):
     hs, as_, per, clk, hab, aab, desc = state
-    if desc in ('Final', 'Scheduled', 'Postponed', 'Canceled'):
+    # Only a live game is evaluated. Any other state (Scheduled, Delayed,
+    # Postponed, Final, ...) returns without touching numbers: a pre-game
+    # state carries period 0 (or None), and evaluating it as a full 48-minute
+    # game fabricates hits. A None period alone is also non-live.
+    if desc != 'In Progress' or per is None:
         return f"{aab}@{hab}: {desc} {as_}:{hs}"
     try:
         if ':' in clk:

@@ -14,6 +14,8 @@
 
 - 用 Polymarket gamma 的 public-search 按队名找到 event slug 和胜负盘的 outcomes 顺序，顺序决定价格数组哪一边是哪队
 
+- slug 不许手拼（2026-10-24 教训）：只许照抄任务正文或 gamma 查到的结果；ESPN 缩写不能直接照搬，实测对照：UTAH→uta、NO→nop、NY→nyk、SA→sas、GS→gsw（2026-10-24 gamma 实测：orl-nyk 有事件、orl-ny 为空）；用队名/地名现拼（如 no-utah）必错，gamma 查不到时 fast_check 直接报 fetch failed；日期用美国日期（北京时间上午的比赛 = 美国前一日）
+
 - 从让分盘主线读赛前预期分差，例如 Spread: Spurs (-2.5) 表示主队 Spurs 赛前预期全场净胜 2.5 分，记为 home_margin 2.5，客队为热门时记负数
 
 - 把 event id、slug、胜负盘 question 原文和 home_margin 交给 scripts 里的 monitor.py，不要临时手写轮询逻辑

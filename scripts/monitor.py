@@ -107,9 +107,15 @@ def main():
         polls += 1
         try:
             st, comp0 = espn_event(args.event_id)
-            period = st.get("period", 0)
-            clock = st.get("displayClock", "0.0")
+            # .get(key, default) does NOT protect against an explicit null:
+            # period None used to raise TypeError on every poll below, and the
+            # loop's except turned it into an endless error-POLL retry.
+            period = st.get("period") or 0
+            clock = st.get("displayClock") or "0.0"
             completed = bool(st.get("type", {}).get("completed"))
+            # Only a live game may trigger. Pre-game states carry period 0,
+            # and scoring them as a full 48-minute game fabricates triggers.
+            live = st.get("type", {}).get("description") == "In Progress"
             comp = comp0.get("competitors", [])
             teams = {}
             order = []
@@ -164,7 +170,7 @@ def main():
                    "ml_prices": prices, "stale_polls": stale}
             trig = None
             cur_thr = args.threshold_q4 if period >= 4 else args.threshold_pre
-            if wp_home is not None and len(outcomes) == 2:
+            if live and wp_home is not None and len(outcomes) == 2:
                 for ha in ("home", "away"):
                     i = idx.get(ha)
                     if i is None: continue
