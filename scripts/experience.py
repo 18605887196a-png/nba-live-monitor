@@ -199,11 +199,15 @@ def stats():
     print("=== user bets ===")
     if bets:
         w, l = _wl(bets)
-        gross = sum(b.get("stake_gross") or 0 for b in bets)
-        refunds = sum(b.get("refund") or 0 for b in bets)
-        payout = sum(b.get("payout") or 0 for b in bets)
+        # P&L only over money-complete bets; incomplete history rows (unknown
+        # price/stake) count in W-L but never in money, and are never estimated.
+        complete = [b for b in bets if b.get("payout") is not None and b.get("stake_gross") is not None]
+        gross = sum(b.get("stake_gross") or 0 for b in complete)
+        refunds = sum(b.get("refund") or 0 for b in complete)
+        payout = sum(b.get("payout") or 0 for b in complete)
         net = gross - refunds
-        print(f"bets: {len(bets)} ({w}W-{l}L)  gross ${gross:.2f}  refunds ${refunds:.2f}  "
+        print(f"bets: {len(bets)} ({w}W-{l}L), {len(complete)} with complete money: "
+              f"gross ${gross:.2f}  refunds ${refunds:.2f}  "
               f"net staked ${net:.2f}  payout ${payout:.2f}  P&L ${payout-net:+.2f}")
     else:
         print("bets: none recorded")
