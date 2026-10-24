@@ -48,14 +48,14 @@ def analyze(gid, slug, hm, state):
         l1, l2 = ls[i], ls[i + 1]
         ua1, ua2 = 1 - totals[l1][0], 1 - totals[l2][0]
         oa1, oa2 = totals[l1][1], totals[l2][1]
-        if ua1 >= 0.5 and ua2 < ua1 - 0.02:
+        if ua1 >= 0.5 and ua2 < ua1 - 0.005:
             out.append(f"  !! 小分倒挂: Under{l2} {ua2*100:.0f}c(倍率{1/ua2:.2f}) 比 Under{l1} {ua1*100:.0f}c 便宜{100*(ua1-ua2):.0f}c 还更好中")
-        if oa2 >= 0.5 and oa2 > oa1 + 0.02:
+        if oa2 >= 0.5 and oa2 > oa1 + 0.005:
             out.append(f"  !! 大分倒挂: Over{l1} {oa1*100:.0f}c(倍率{1/oa1:.2f}) 比 Over{l2} {oa2*100:.0f}c 更易中还便宜{100*(oa2-oa1):.0f}c")
     for team, arr in spreads.items():
         arr.sort()
         for i in range(len(arr) - 1):
-            if arr[i + 1][1] < arr[i][1] - 0.02 and arr[i][1] >= 0.3:
+            if arr[i + 1][1] < arr[i][1] - 0.005 and arr[i][1] >= 0.3:
                 out.append(f"  !! 让分倒挂: {team} {arr[i+1][0]} 现价 {arr[i+1][1]*100:.0f}c(倍率{1/arr[i+1][1]:.2f}) 比 {arr[i][0]} 现价 {arr[i][1]*100:.0f}c 更易中还便宜{100*(arr[i][1]-arr[i+1][1]):.0f}c")
     return "\n".join(out)
 
