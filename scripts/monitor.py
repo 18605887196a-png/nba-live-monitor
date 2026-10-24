@@ -4,6 +4,9 @@
 Polls every --poll seconds, evaluates an in-game win-probability model
 against the Polymarket moneyline book, and exits on a trigger, on the
 end-of-Q3 snapshot (mode q3), or at the final buzzer (mode final).
+In mode final it also emits two fixed analysis nodes without exiting:
+Q3_NODE when Q4 starts and Q4_6MIN_NODE when Q4 reaches 6:00 remaining;
+each fires once (a late join in Q4 at <=6:00 fires only the Q4 node).
 Read-only. Places no orders.
 
 Model (per team): WP = Phi((lead + M * t/48) / (13 * sqrt(t/48)))
@@ -65,6 +68,28 @@ def parse_clock(clock):
     except Exception:
         return 0.0
 
+def check_nodes(fired, period, t, live, completed):
+    """Fixed analysis nodes (user, 2026-10-24): Q3 end + Q4 6:00 left.
+
+    Pure helper (unit-tested): fired is a set of node names already emitted.
+    Returns (node_or_None, new_fired_set). Only period == 4 counts; OT
+    (period >= 5) never fires a node, and a game that already ended or has
+    t <= 0.5 never fires one either. A late join in Q4 at <= 6:00 fires
+    only the Q4 node (the Q3 node is superseded).
+    """
+    fired = set(fired)
+    if not live or completed or t <= 0.5 or period != 4:
+        return None, fired
+    if t <= 6.0:
+        if "q4_6min" not in fired:
+            fired.update(("q4_6min", "q3"))
+            return "q4_6min", fired
+        return None, fired
+    if "q3" not in fired:
+        fired.add("q3")
+        return "q3", fired
+    return None, fired
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--event-id", required=True)
@@ -94,7 +119,7 @@ def main():
         line = json.dumps({"kind": kind, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), **data}, ensure_ascii=False)
         print(line, flush=True)
         logf.write(line + "\n")
-        if kind in ("TRIGGER", "Q3_SNAPSHOT", "Q4_CHECKPOINT", "FINAL", "TEST"):
+        if kind in ("TRIGGER", "Q3_SNAPSHOT", "Q4_CHECKPOINT", "Q3_NODE", "Q4_6MIN_NODE", "FINAL", "TEST"):
             with open(args.out, "w") as f:
                 f.write(line + "\n")
 
@@ -102,6 +127,7 @@ def main():
     polls = 0
     last_state = None
     stale = 0
+    nodes_fired = set()  # fixed analysis nodes already emitted (Q3 end, Q4 6:00)
 
     while True:
         polls += 1
@@ -243,6 +269,15 @@ def main():
                 # q3 mode used to exit on trigger and never emit Q3_SNAPSHOT)
                 if args.mode == "trigger":
                     return 0
+            # Fixed analysis nodes (mode final only; q3/trigger modes keep their
+            # own exits). Nodes never exit the loop: the monitor keeps running
+            # so mid/late-game high-prob events still push one message each.
+            if args.mode == "final":
+                node, nodes_fired = check_nodes(nodes_fired, period, t, live, completed)
+                if node == "q3":
+                    emit("Q3_NODE", row)
+                elif node == "q4_6min":
+                    emit("Q4_6MIN_NODE", row)
             if args.mode == "q3" and period >= 4:
                 emit("Q3_SNAPSHOT", row)
                 return 0

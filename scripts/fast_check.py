@@ -5,6 +5,9 @@ Tiering (user, 2026-10-24):
 - MAIN: any ML/spread/total line with model prob >= 90% (totals also need |proj-line| >= 10)
 - AUX: ladder inversion (any size >= 0.5c) with real two-sided quotes and
   easier-line model prob >= 85%; below 85% is filtered out in code.
+Output (user, 2026-10-24): conclusion-first — a 结论 line names the single
+top pick (best leak, else best hit); leaks print with a 【倒挂】 marker and
+stay first; no model-vs-market gap analysis is printed.
 
 Usage: python3 fast_check.py <US date YYYYMMDD> <event_id:slug:home_margin> [...]
 home_margin: pregame expected full-game margin for home team (positive if home favored).
@@ -161,8 +164,6 @@ def analyze(gid, slug, hm, state):
     # Priority (user, 2026-10-24 12:10 + 12:15): qualified inversions first,
     # then ML/totals hits, spreads always last (late-game margin is the least stable).
     leaks_sorted = [l for l in leaks if not l.startswith("LEAK Spread")] + [l for l in leaks if l.startswith("LEAK Spread")]
-    for lk in leaks_sorted[:3]:
-        out.append(f"  [{lk}]")
     main_hits = sorted([h for h in hits if not h[1].startswith("Spread")], reverse=True)
     spread_hits = sorted([h for h in hits if h[1].startswith("Spread")], reverse=True)
     # Per-type caps (fix 2026-10-24): a flat [:4] let a stack of totals rows crowd out
@@ -170,6 +171,13 @@ def analyze(gid, slug, hm, state):
     ml_hits = [h for h in main_hits if h[1].startswith("ML")]
     tot_hits = [h for h in main_hits if not h[1].startswith("ML")]
     shown = sorted(ml_hits[:2] + tot_hits[:2], reverse=True) + spread_hits[:1]
+    # Conclusion-first (user, 2026-10-24): one line naming the single top pick
+    # (best leak, else best hit); leaks print with a prominent 【倒挂】 marker.
+    top = leaks_sorted[0] if leaks_sorted else (shown[0][1] if shown else None)
+    if top:
+        out.append(f"结论：{top}")
+    for lk in leaks_sorted[:3]:
+        out.append(f"  【倒挂】{lk}")
     for _, h in shown:
         out.append(f"  [HIT] {h}")
     if not hits and not leaks:
