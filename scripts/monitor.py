@@ -80,7 +80,7 @@ def main():
     ap.add_argument("--checkpoint", type=float, default=0.0, help="if >0, exit with Q4_CHECKPOINT when period>=4 and minutes remaining <= this value")
     ap.add_argument("--mode", choices=["q3", "final", "trigger"], default="final",
                     help="q3: exit with snapshot when Q4 starts. final: run to buzzer. trigger: exit on first trigger or buzzer.")
-    ap.add_argument("--poll", type=int, default=12)
+    ap.add_argument("--poll", type=int, default=20)
     ap.add_argument("--max-polls", type=int, default=0, help="0 = unlimited (test with 1)")
     ap.add_argument("--out", default="/tmp/nba_monitor_result.txt")
     ap.add_argument("--log", default="/tmp/nba_monitor.log")

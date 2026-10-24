@@ -117,6 +117,8 @@
 
 ## Available connectors
 
+- [Telegram](~/workspace/custom-connectors/custom.telegram/CONNECTOR.md)：给用户发 Telegram 推送消息。
+
 - Use `muse.connector_search` to find other connectors and `muse.skill_search` to find related skills.
 
 - If nothing here fits, look on the web for a maintained API or MCP server and set it up with [Custom Connectors and MCPs](/opt/muse/skills/custom-connector-setup/SKILL.md), or build a custom connector.
@@ -129,6 +131,6 @@
 
 ## Alternatives for better results
 
-- 常驻版想要更低延迟时改用 Polymarket CLOB 的 websocket 通道 wss://ws-subscriptions-clob.polymarket.com/ws/market 订阅胜负盘 token，单场临时监控用 12 秒 REST 轮询已经够，延迟差对用户手动下单没有实际影响
+- 常驻版想要更低延迟时改用 Polymarket CLOB 的 websocket 通道 wss://ws-subscriptions-clob.polymarket.com/ws/market 订阅胜负盘 token，单场临时监控用 20 秒 REST 轮询已经够，延迟差对用户手动下单没有实际影响
 
 - 模型想更准时可以用 Pinnacle 滚球赔率做第二基准交叉验证，两边模型相差超过 4 个百分点时以更保守的一边为准
