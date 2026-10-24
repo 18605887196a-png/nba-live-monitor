@@ -199,6 +199,40 @@ def main():
             if trig:
                 emit("TRIGGER", {"trigger": trig, "period": period, "clock": clock,
                                  "score": f"{away.get('name')} {away.get('score')} : {home.get('score')} {home.get('name')}"})
+                # Experience bank: one record per (event, side) trigger, first wins.
+                # Self-contained on purpose (monitor.py runs detached via setsid);
+                # logging must never break the monitor loop.
+                try:
+                    import datetime as _dt, os as _os
+                    _cst = _dt.timezone(_dt.timedelta(hours=8))
+                    _now = _dt.datetime.now(_cst)
+                    _dus = (_now - _dt.timedelta(days=1)).strftime("%Y%m%d") if _now.hour < 15 else _now.strftime("%Y%m%d")
+                    _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "experience", "pushes.jsonl")
+                    _os.makedirs(_os.path.dirname(_p), exist_ok=True)
+                    _rec = {"ts": _now.strftime("%Y-%m-%d %H:%M:%S"), "date_us": _dus,
+                            "event_id": str(args.event_id),
+                            "game": f"{away.get('name')} @ {home.get('name')}",
+                            "market": "ml", "pick": trig["side"], "line": None,
+                            "price_c": round(trig["ask"] * 100, 1), "prob": trig["wp"],
+                            "kind": "trigger", "delivered": True,
+                            "score": f"{away.get('score')}:{home.get('score')}",
+                            "clock": f"Q{period} {clock}", "result": None}
+                    _dup = False
+                    if _os.path.exists(_p):
+                        with open(_p) as _f:
+                            for _l in _f:
+                                try:
+                                    _r = json.loads(_l)
+                                except Exception:
+                                    continue
+                                if (_r.get("event_id"), _r.get("market"), _r.get("pick")) == (_rec["event_id"], "ml", _rec["pick"]):
+                                    _dup = True
+                                    break
+                    if not _dup:
+                        with open(_p, "a") as _f:
+                            _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
                 # trigger is data-log only; only mode=trigger exits on it (2026-10-24 fix:
                 # q3 mode used to exit on trigger and never emit Q3_SNAPSHOT)
                 if args.mode == "trigger":

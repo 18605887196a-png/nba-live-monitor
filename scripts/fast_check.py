@@ -9,8 +9,37 @@ Tiering (user, 2026-10-24):
 Usage: python3 fast_check.py <US date YYYYMMDD> <event_id:slug:home_margin> [...]
 home_margin: pregame expected full-game margin for home team (positive if home favored).
 """
-import json, math, sys, time, urllib.request
+import json, math, re, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
+
+DATE_US = None  # set by main(); used as the experience-bank date key
+
+def _parse_rec(text, ctx, kind):
+    """Turn one shown HIT/LEAK line into an experience-bank record (or None)."""
+    m = re.search(r"ask (\d+(?:\.\d+)?)c", text)
+    price = float(m.group(1)) if m else None
+    pm = re.search(r"(?:prob|cover) (\d+(?:\.\d+)?)%", text)
+    prob = float(pm.group(1)) / 100 if pm else None
+    base = dict(ctx, price_c=price, prob=prob, delivered=True, result=None)
+    mm = re.match(r"ML (\S+) ask", text)
+    if mm:
+        return {**base, "market": "ml", "pick": mm.group(1), "line": None, "kind": kind}
+    mm = re.match(r"Spread (.+) \(([+-]?\d+(?:\.\d+)?)\) ask", text)
+    if mm:
+        return {**base, "market": "spread", "pick": mm.group(1), "line": float(mm.group(2)), "kind": kind}
+    mm = re.match(r"Total (Over|Under) (\d+(?:\.\d+)?) ask", text)
+    if mm:
+        return {**base, "market": "total", "pick": mm.group(1), "line": float(mm.group(2)), "kind": kind}
+    mm = re.match(r"LEAK Plus (.+) \(([+-]?\d+(?:\.\d+)?)\) ask", text)
+    if mm:
+        return {**base, "market": "spread", "pick": mm.group(1), "line": float(mm.group(2)), "kind": "leak_plus"}
+    mm = re.match(r"LEAK (Over|Under) (\d+(?:\.\d+)?) ask", text)
+    if mm:
+        return {**base, "market": "total", "pick": mm.group(1), "line": float(mm.group(2)), "kind": "leak"}
+    mm = re.match(r"LEAK Spread (.+) \(([+-]?\d+(?:\.\d+)?)\) ask", text)
+    if mm:
+        return {**base, "market": "spread", "pick": mm.group(1), "line": float(mm.group(2)), "kind": "leak"}
+    return None
 
 def get(u, timeout=12):
     r = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
@@ -27,7 +56,10 @@ def analyze(gid, slug, hm, state):
     if desc in ('Final', 'Scheduled', 'Postponed', 'Canceled'):
         return f"{aab}@{hab}: {desc} {as_}:{hs}"
     try:
-        mm, ss = clk.split(':'); clock = float(mm) + float(ss) / 60
+        if ':' in clk:
+            mm, ss = clk.split(':'); clock = float(mm) + float(ss) / 60
+        else:
+            clock = float(clk) / 60  # ESPN shows bare seconds ("43.5") under a minute
     except Exception:
         clock = 0.0
     t = (4 - per) * 12 + clock if per <= 4 else clock
@@ -77,12 +109,22 @@ def analyze(gid, slug, hm, state):
                 cover[(team, ln)] = (p, a)
                 if p >= 0.90:
                     hits.append((p, f"Spread {team} ({ln:+.1f}) ask {fmt_price(a)} cover {p*100:.0f}%"))
+                # Plus-line flip (user, 2026-10-24): the No side of a negative spread line is the
+                # other team GETTING points (No on Clippers -3.5 == Lakers +3.5). It strictly
+                # dominates that team's moneyline, so ask <= ML ask at prob >= 85% = top leak.
+                if ln < 0 and ml and len(team_names) == 2 and b and b >= 0.02:
+                    other = team_names[1] if team == team_names[0] else team_names[0]
+                    p_no = 1 - p
+                    ask_no = 1 - b
+                    ml_a = ml[1] if other == team_names[0] else 1 - ml[0]
+                    if p_no >= 0.85 and ask_no <= ml_a and ask_no < 0.999:
+                        leaks.append(f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%")
     for ln, (b, a) in totals.items():
         p_over = Phi((mu - ln) / sd_t)
         if p_over >= 0.90 and mu - ln >= 10:
-            hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (proj {mu:.0f})"))
+            hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
         if 1 - p_over >= 0.90 and ln - mu >= 10:
-            hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (proj {mu:.0f})"))
+            hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
     ls = sorted(totals)
     for i in range(len(ls) - 1):
         l1, l2 = ls[i], ls[i + 1]
@@ -91,11 +133,11 @@ def analyze(gid, slug, hm, state):
         if ua2 < ua1 - 0.005:
             p = 1 - Phi((mu - l2) / sd_t)
             if p >= 0.85:
-                leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}%")
+                leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})")
         if oa2 > oa1 + 0.005:
             p = Phi((mu - l1) / sd_t)
             if p >= 0.85:
-                leaks.append(f"LEAK Over {l1} ask {fmt_price(oa1)} vs Over {l2} {fmt_price(oa2)}: easier+cheaper by {100*(oa2-oa1):.0f}c, prob {p*100:.0f}%")
+                leaks.append(f"LEAK Over {l1} ask {fmt_price(oa1)} vs Over {l2} {fmt_price(oa2)}: easier+cheaper by {100*(oa2-oa1):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, need {l1-tot:.0f} more, proj {mu:.0f})")
     for team, arr in spreads.items():
         arr2 = sorted(arr)
         for i in range(len(arr2) - 1):
@@ -106,18 +148,50 @@ def analyze(gid, slug, hm, state):
                 if p >= 0.85:
                     leaks.append(f"LEAK Spread {team} ({ln2:+.1f}) ask {fmt_price(a2)} vs ({ln1:+.1f}) {fmt_price(a1)}: easier+cheaper by {100*(a1-a2):.0f}c, cover {p*100:.0f}%")
 
-    out = [f"{aab} {as_} @ {hab} {hs} | Q{per} {clk} | WP {aab} {(1-wp_home)*100:.0f}% / {hab} {wp_home*100:.0f}% | proj total {mu:.0f}"]
-    hits.sort(reverse=True)
-    for _, h in hits[:4]:
-        out.append(f"  [HIT] {h}")
-    for lk in leaks[:3]:
+    # OT probability (user, 2026-10-24): P(final margin lands on 0) under the same normal model.
+    ot = 0.0
+    if sd_m:
+        mean_m_home = lead + hm * t / 48
+        ot = Phi((0.5 - mean_m_home) / sd_m) - Phi((-0.5 - mean_m_home) / sd_m)
+    out = [f"{aab} {as_} @ {hab} {hs} | Q{per} {clk} | WP {aab} {(1-wp_home)*100:.0f}% / {hab} {wp_home*100:.0f}% | proj total {mu:.0f} | OT {ot*100:.0f}%"]
+    # Priority (user, 2026-10-24 12:10 + 12:15): qualified inversions first,
+    # then ML/totals hits, spreads always last (late-game margin is the least stable).
+    leaks_sorted = [l for l in leaks if not l.startswith("LEAK Spread")] + [l for l in leaks if l.startswith("LEAK Spread")]
+    for lk in leaks_sorted[:3]:
         out.append(f"  [{lk}]")
+    main_hits = sorted([h for h in hits if not h[1].startswith("Spread")], reverse=True)
+    spread_hits = sorted([h for h in hits if h[1].startswith("Spread")], reverse=True)
+    # Per-type caps (fix 2026-10-24): a flat [:4] let a stack of totals rows crowd out
+    # the moneyline hit entirely. ML always shows, totals capped at 2, spreads at 1.
+    ml_hits = [h for h in main_hits if h[1].startswith("ML")]
+    tot_hits = [h for h in main_hits if not h[1].startswith("ML")]
+    shown = sorted(ml_hits[:2] + tot_hits[:2], reverse=True) + spread_hits[:1]
+    for _, h in shown:
+        out.append(f"  [HIT] {h}")
     if not hits and not leaks:
         out.append("  no hit / no leak")
+    # Experience bank: log every line we are about to show; first sighting of a
+    # line wins, re-scans never overwrite it. Logging must never break a scan.
+    try:
+        import experience as _exp
+        _ctx = {"date_us": DATE_US, "event_id": str(gid), "game": f"{aab}@{hab}",
+                "score": f"{aab} {as_}:{hs} {hab}", "clock": f"Q{per} {clk}"}
+        for _t in leaks_sorted[:3]:
+            _r = _parse_rec(_t, _ctx, "leak")
+            if _r:
+                _exp.log_push(_r)
+        for _, _t in shown:
+            _r = _parse_rec(_t, _ctx, "hit")
+            if _r:
+                _exp.log_push(_r)
+    except Exception:
+        pass
     return "\n".join(out)
 
 def main():
+    global DATE_US
     date = sys.argv[1]
+    DATE_US = date
     specs = []
     for s in sys.argv[2:]:
         gid, slug, hm = s.split(':')
