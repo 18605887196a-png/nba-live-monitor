@@ -348,8 +348,10 @@ def main():
             return f"{k[1]}|{k[2]}|{k[3]}"
         cur = set(sig_of(k) for k, _ in items)
         newly = [(k, info) for k, info in items if sig_of(k) not in prev]
-        newly_main = [(k, i) for k, i in newly if not (k[0] == "hit" and k[1] == "spread")]
-        newly_spread = [(k, i) for k, i in newly if k[0] == "hit" and k[1] == "spread"]
+        # Spread lines (any kind) are attach-only, never triggers
+        # (user 2026-10-25: spread leaks demoted - late leads collapse systematically).
+        newly_main = [(k, i) for k, i in newly if k[1] != "spread"]
+        newly_spread = [(k, i) for k, i in newly if k[1] == "spread"]
         # Fixed nodes (minimum guarantee: every game gets a Q3-end broadcast
         # and a Q4-6min broadcast, even if no line qualifies -> one-line status).
         per = state["per"]
@@ -360,15 +362,15 @@ def main():
         if prev_per <= 2 and per >= 3:
             prev = set()
             newly = [(k, info) for k, info in items if sig_of(k) not in prev]
-            newly_main = [(k, i) for k, i in newly if not (k[0] == "hit" and k[1] == "spread")]
-            newly_spread = [(k, i) for k, i in newly if k[0] == "hit" and k[1] == "spread"]
+            newly_main = [(k, i) for k, i in newly if k[1] != "spread"]
+            newly_spread = [(k, i) for k, i in newly if k[1] == "spread"]
         prev_per = per
         # Cooldown (user 2026-10-25): a line sent within 15 min never resends,
         # even if it dropped out and returned (kills flicker spam).
         _now = time.time()
         newly = [(k, i) for k, i in newly if _now - sent_at.get(sig_key(k), 0) >= 900]
-        newly_main = [(k, i) for k, i in newly if not (k[0] == "hit" and k[1] == "spread")]
-        newly_spread = [(k, i) for k, i in newly if k[0] == "hit" and k[1] == "spread"]
+        newly_main = [(k, i) for k, i in newly if k[1] != "spread"]
+        newly_spread = [(k, i) for k, i in newly if k[1] == "spread"]
         node_kind = None
         if not q3_node and per == 4 and clk_s > 0:
             node_kind = "q3"
@@ -376,8 +378,8 @@ def main():
             node_kind = "q4"
         if node_kind:
             label = "【三节结束】" if node_kind == "q3" else "【Q4剩6分钟】"
-            main_all = [(k, i) for k, i in items if not (k[0] == "hit" and k[1] == "spread")]
-            spread_all = [(k, i) for k, i in items if k[0] == "hit" and k[1] == "spread"]
+            main_all = [(k, i) for k, i in items if k[1] != "spread"]
+            spread_all = [(k, i) for k, i in items if k[1] == "spread"]
             if main_all:
                 node_msg = compose(state, main_all, spread_all, prefix=label)
             else:
@@ -418,7 +420,7 @@ def main():
         # Q1/Q2 regular hits never send (early gate, already live).
         _confirmed = [(k, i) for k, i in items
                       if sig_of(k) in pending and sig_of(k) in cur
-                      and not (k[0] == "hit" and k[1] == "spread")]
+                      and k[1] != "spread"]
         _new_leaks = [(k, i) for k, i in newly_main if k[0] in ("leak", "leak_plus")]
         _new_hits = [(k, i) for k, i in newly_main
                      if k[0] not in ("leak", "leak_plus") and sig_of(k) not in pending]
