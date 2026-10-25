@@ -79,7 +79,11 @@ def analyze(gid, slug, hm, state):
     tot = hs + as_
     # Note (user 2026-10-25): no total-based staleness guard - total has no
     # necessary relation to frozen data; pushes are probability-driven.
-    totals_ok = elapsed >= 15 and tot > 0
+    # Totals Q3-end gate (user 2026-10-25, FIRST priority, overrides leak-first):
+    # no totals prediction before Q3 ends (per < 4), for hits AND leaks.
+    # Q3 just started has only minutes of second-half pace; totals need three
+    # full quarters before they can be predicted.
+    totals_ok = per >= 4 and elapsed >= 15 and tot > 0
     hit_ok = not (per == 4 and t > 5.0 and abs(lead) < 30)  # Q4 HIT gate (user 2026-10-25): hold early-Q4 HITs until last 5:00, unless 30+ blowout
     pace = (tot + 4.71 * 12) / (elapsed + 12) if elapsed > 0 else 4.71
     mu = tot + pace * t
