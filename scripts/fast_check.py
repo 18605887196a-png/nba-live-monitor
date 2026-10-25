@@ -77,6 +77,11 @@ def analyze(gid, slug, hm, state):
     sd_m = 13 * math.sqrt(t / 48) if t >= 0.5 else 0.0
     wp_home = Phi((lead + hm * t / 48) / sd_m) if sd_m else 0.5
     tot = hs + as_
+    # Stale-snapshot guard (user 2026-10-25): a per>=3 game showing a halftime-like
+    # total (<150) is a frozen scoreboard (e.g. halftime score stuck at Q3 0.0);
+    # skip evaluation instead of pushing confident lines off stale numbers.
+    if per >= 3 and tot < 150:
+        return f"{aab}@{hab}: stale snapshot {as_}:{hs} (Q{per} {clk}), skip"
     totals_ok = elapsed >= 15 and tot > 0
     hit_ok = not (per == 4 and t > 5.0 and abs(lead) < 30)  # Q4 HIT gate (user 2026-10-25): hold early-Q4 HITs until last 5:00, unless 30+ blowout
     pace = (tot + 4.71 * 12) / (elapsed + 12) if elapsed > 0 else 4.71
