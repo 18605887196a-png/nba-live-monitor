@@ -12,18 +12,18 @@ stay first; no model-vs-market gap analysis is printed.
 Usage: python3 fast_check.py <US date YYYYMMDD> <event_id:slug:home_margin> [...]
 home_margin: pregame expected full-game margin for home team (positive if home favored).
 """
-import json, math, re, sys, time, urllib.request
+import json, math, os, re, sys, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 DATE_US = None  # set by main(); used as the experience-bank date key
 
-def _parse_rec(text, ctx, kind):
+def _parse_rec(text, ctx, kind, delivered=True):
     """Turn one shown HIT/LEAK line into an experience-bank record (or None)."""
     m = re.search(r"ask (\d+(?:\.\d+)?)c", text)
     price = float(m.group(1)) if m else None
     pm = re.search(r"(?:prob|cover) (\d+(?:\.\d+)?)%", text)
     prob = float(pm.group(1)) / 100 if pm else None
-    base = dict(ctx, price_c=price, prob=prob, delivered=True, result=None)
+    base = dict(ctx, price_c=price, prob=prob, delivered=delivered, result=None)
     mm = re.match(r"ML (\S+) ask", text)
     if mm:
         return {**base, "market": "ml", "pick": mm.group(1), "line": None, "kind": kind}
@@ -60,7 +60,8 @@ def analyze(gid, slug, hm, state):
     # Postponed, Final, ...) returns without touching numbers: a pre-game
     # state carries period 0 (or None), and evaluating it as a full 48-minute
     # game fabricates hits. A None period alone is also non-live.
-    if desc != 'In Progress' or per is None:
+    # Halftime counts as live: real score, 24 min remaining, no fabrication.
+    if desc not in ('In Progress', 'Halftime') or per is None:
         return f"{aab}@{hab}: {desc} {as_}:{hs}"
     try:
         if ':' in clk:
@@ -75,6 +76,7 @@ def analyze(gid, slug, hm, state):
     sd_m = 13 * math.sqrt(t / 48) if t >= 0.5 else 0.0
     wp_home = Phi((lead + hm * t / 48) / sd_m) if sd_m else 0.5
     tot = hs + as_
+    totals_ok = elapsed >= 15 and tot > 0
     pace = (tot + 4.71 * 12) / (elapsed + 12) if elapsed > 0 else 4.71
     mu = tot + pace * t
     sd_t = min(2.0 * math.sqrt(pace * t), 21) if t > 0 else 1.0
@@ -128,9 +130,9 @@ def analyze(gid, slug, hm, state):
                         leaks.append(f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%")
     for ln, (b, a) in totals.items():
         p_over = Phi((mu - ln) / sd_t)
-        if p_over >= 0.90 and mu - ln >= 10:
+        if totals_ok and p_over >= 0.90 and mu - ln >= 10:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
-        if 1 - p_over >= 0.90 and ln - mu >= 10:
+        if totals_ok and 1 - p_over >= 0.90 and ln - mu >= 10:
             hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
     ls = sorted(totals)
     for i in range(len(ls) - 1):
@@ -139,11 +141,11 @@ def analyze(gid, slug, hm, state):
         oa1, oa2 = totals[l1][1], totals[l2][1]
         if ua2 < ua1 - 0.005:
             p = 1 - Phi((mu - l2) / sd_t)
-            if p >= 0.85:
+            if totals_ok and p >= 0.85:
                 leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})")
         if oa2 > oa1 + 0.005:
             p = Phi((mu - l1) / sd_t)
-            if p >= 0.85:
+            if totals_ok and p >= 0.85:
                 leaks.append(f"LEAK Over {l1} ask {fmt_price(oa1)} vs Over {l2} {fmt_price(oa2)}: easier+cheaper by {100*(oa2-oa1):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, need {l1-tot:.0f} more, proj {mu:.0f})")
     for team, arr in spreads.items():
         arr2 = sorted(arr)
@@ -188,12 +190,16 @@ def analyze(gid, slug, hm, state):
         import experience as _exp
         _ctx = {"date_us": DATE_US, "event_id": str(gid), "game": f"{aab}@{hab}",
                 "score": f"{aab} {as_}:{hs} {hab}", "clock": f"Q{per} {clk}"}
+        # Early-game gate (user 2026-10-25): Q1/Q2 regular hits are logged-only
+        # (delivered=False) when the sender sets FC_EARLY_LOG_ONLY; leaks are
+        # always sent (fleeting arbitrage) so they stay delivered=True.
+        _early_gated = os.environ.get("FC_EARLY_LOG_ONLY") == "1" and per <= 2
         for _t in leaks_sorted[:3]:
-            _r = _parse_rec(_t, _ctx, "leak")
+            _r = _parse_rec(_t, _ctx, "leak", delivered=True)
             if _r:
                 _exp.log_push(_r)
         for _, _t in shown:
-            _r = _parse_rec(_t, _ctx, "hit")
+            _r = _parse_rec(_t, _ctx, "hit", delivered=not _early_gated)
             if _r:
                 _exp.log_push(_r)
     except Exception:
