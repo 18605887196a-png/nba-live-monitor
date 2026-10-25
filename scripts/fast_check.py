@@ -2,7 +2,8 @@
 """fast_check.py - parallel ESPN scores + gamma books, tiered output.
 
 Tiering (user, 2026-10-24):
-- MAIN: any ML/spread/total line with model prob >= 90% (totals also need |proj-line| >= 10)
+- MAIN: any ML/spread/total line with model prob >= 95% (totals also need |proj-line| >= 10)
+- Q4 HIT gate (user 2026-10-25): Q4 HITs only when <=5:00 remains; early-Q4 HITs held (leaks ungated)
 - AUX: ladder inversion (any size >= 0.5c) with real two-sided quotes and
   easier-line model prob >= 85%; below 85% is filtered out in code.
 Output (user, 2026-10-24): conclusion-first — a 结论 line names the single
@@ -77,6 +78,7 @@ def analyze(gid, slug, hm, state):
     wp_home = Phi((lead + hm * t / 48) / sd_m) if sd_m else 0.5
     tot = hs + as_
     totals_ok = elapsed >= 15 and tot > 0
+    hit_ok = not (per == 4 and t > 5.0 and abs(lead) < 30)  # Q4 HIT gate (user 2026-10-25): hold early-Q4 HITs until last 5:00, unless 30+ blowout
     pace = (tot + 4.71 * 12) / (elapsed + 12) if elapsed > 0 else 4.71
     mu = tot + pace * t
     sd_t = min(2.0 * math.sqrt(pace * t), 21) if t > 0 else 1.0
@@ -104,9 +106,9 @@ def analyze(gid, slug, hm, state):
 
     hits, leaks = [], []
     if ml and sd_m:
-        if 1 - wp_home >= 0.90:
+        if hit_ok and 1 - wp_home >= 0.95:
             hits.append((1 - wp_home, f"ML {aab} ask {fmt_price(ml[1])} prob {(1-wp_home)*100:.0f}%"))
-        if wp_home >= 0.90:
+        if hit_ok and wp_home >= 0.95:
             hits.append((wp_home, f"ML {hab} ask {fmt_price(1-ml[0])} prob {wp_home*100:.0f}%"))
     cover = {}
     for team, arr in spreads.items():
@@ -116,7 +118,7 @@ def analyze(gid, slug, hm, state):
             if sd_m:
                 p = Phi((mean_m + ln) / sd_m)
                 cover[(team, ln)] = (p, a)
-                if p >= 0.90:
+                if hit_ok and p >= 0.95:
                     hits.append((p, f"Spread {team} ({ln:+.1f}) ask {fmt_price(a)} cover {p*100:.0f}%"))
                 # Plus-line flip (user, 2026-10-24): the No side of a negative spread line is the
                 # other team GETTING points (No on Clippers -3.5 == Lakers +3.5). It strictly
@@ -130,9 +132,9 @@ def analyze(gid, slug, hm, state):
                         leaks.append(f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%")
     for ln, (b, a) in totals.items():
         p_over = Phi((mu - ln) / sd_t)
-        if totals_ok and p_over >= 0.90 and mu - ln >= 10:
+        if hit_ok and totals_ok and p_over >= 0.95 and mu - ln >= 10:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
-        if totals_ok and 1 - p_over >= 0.90 and ln - mu >= 10:
+        if hit_ok and totals_ok and 1 - p_over >= 0.95 and ln - mu >= 10:
             hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
     ls = sorted(totals)
     for i in range(len(ls) - 1):
