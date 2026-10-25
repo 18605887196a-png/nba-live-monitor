@@ -5,7 +5,7 @@ Tiering (user, 2026-10-24):
 - MAIN: any ML/spread/total line with model prob >= 95% (totals also need |proj-line| >= 10)
 - Q4 HIT gate (user 2026-10-25): Q4 HITs only when <=5:00 remains; early-Q4 HITs held (leaks ungated)
 - AUX: ladder inversion (any size >= 0.5c) with real two-sided quotes and
-  easier-line model prob >= 85%; below 85% is filtered out in code.
+  easier-line model prob >= 90%; below 90% is filtered out in code.
 Output (user, 2026-10-24): conclusion-first — a 结论 line names the single
 top pick (best leak, else best hit); leaks print with a 【倒挂】 marker and
 stay first; no model-vs-market gap analysis is printed.
@@ -122,13 +122,13 @@ def analyze(gid, slug, hm, state):
                     hits.append((p, f"Spread {team} ({ln:+.1f}) ask {fmt_price(a)} cover {p*100:.0f}%"))
                 # Plus-line flip (user, 2026-10-24): the No side of a negative spread line is the
                 # other team GETTING points (No on Clippers -3.5 == Lakers +3.5). It strictly
-                # dominates that team's moneyline, so ask <= ML ask at prob >= 85% = top leak.
+                # dominates that team's moneyline, so ask <= ML ask at prob >= 90% = top leak.
                 if ln < 0 and ml and len(team_names) == 2 and b and b >= 0.02:
                     other = team_names[1] if team == team_names[0] else team_names[0]
                     p_no = 1 - p
                     ask_no = 1 - b
                     ml_a = ml[1] if other == team_names[0] else 1 - ml[0]
-                    if p_no >= 0.85 and ask_no <= ml_a and ask_no < 0.999:
+                    if p_no >= 0.90 and ask_no <= ml_a and ask_no < 0.999:
                         leaks.append(f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%")
     for ln, (b, a) in totals.items():
         p_over = Phi((mu - ln) / sd_t)
@@ -143,11 +143,11 @@ def analyze(gid, slug, hm, state):
         oa1, oa2 = totals[l1][1], totals[l2][1]
         if ua2 < ua1 - 0.005:
             p = 1 - Phi((mu - l2) / sd_t)
-            if totals_ok and p >= 0.85:
+            if totals_ok and p >= 0.90:
                 leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})")
         if oa2 > oa1 + 0.005:
             p = Phi((mu - l1) / sd_t)
-            if totals_ok and p >= 0.85:
+            if totals_ok and p >= 0.90:
                 leaks.append(f"LEAK Over {l1} ask {fmt_price(oa1)} vs Over {l2} {fmt_price(oa2)}: easier+cheaper by {100*(oa2-oa1):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, need {l1-tot:.0f} more, proj {mu:.0f})")
     for team, arr in spreads.items():
         arr2 = sorted(arr)
@@ -156,7 +156,7 @@ def analyze(gid, slug, hm, state):
             ln2, b2, a2 = arr2[i + 1]
             if a2 < a1 - 0.005:
                 p = cover.get((team, ln2), (0, 0))[0]
-                if p >= 0.85:
+                if p >= 0.90:
                     leaks.append(f"LEAK Spread {team} ({ln2:+.1f}) ask {fmt_price(a2)} vs ({ln1:+.1f}) {fmt_price(a1)}: easier+cheaper by {100*(a1-a2):.0f}c, cover {p*100:.0f}%")
 
     # OT probability (user, 2026-10-24): P(final margin lands on 0) under the same normal model.
