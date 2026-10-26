@@ -111,3 +111,9 @@ launch 任务 └─ worker 赛前备参数（slug / home_margin / 总分主线 
 - 过程窗口断采：窗口只在真实采样通过时才算 full。基准离窗口起点偏差、窗口内相邻快照的比赛用时缺口超过 WINDOW_MAX_GAP_MIN（3 分钟，正常 45 秒一轮）时标 insufficient_coverage、记 history_gap，不出 2/5 分钟结论，仍按真实跨度展示观察到的变化，不插值。risk_tags 与 decision 只认 coverage_status=="full"，旧的 coverage>=1.0 兜底已删。暂停不误判：缺口按比赛用时算，暂停不推进比赛用时。
 - 复查锁原合约：解析时按 conditionId 建分合约映射；复查先比身份再比交易状态和原条件。原合约在则用原合约的报价与交易状态复查（含并存合约）；原合约在但无可用报价标数据缺失；原合约不在而同名其他合约在标 identity_mismatch；旧记录无 conditionId 标 identity_unknown；总分另核对已记录 token 身份。以上一律 REVIEW，不借用替代报价、不判失效、不判结算。跟踪主键本次未改，同名新合约独立跟踪为后续工作。
 
+## 复查视图与原合约状态补丁（2026-10-26，ba976f7 回顾 P1/P2）
+
+- P1 修复：`_eval_tracked` 内给 ml/totals/spreads 赋值会使它们在整个函数内成为局部变量，未初始化就读取会抛 UnboundLocalError（被包成 context_error），总分匹配路径与原合约消失路径都中招。修复为函数入口显式从外层视图初始化本地复查视图，匹配时先拷贝再替换，每条信号独立视图、互不污染。
+- P2 修复：身份、交易状态、报价三条件分开。原合约在但无可用报价时，先查原合约自己的交易状态：closed 判 CLOSED、paused/inactive 判 market_paused，只有可交易但无报价才判 data_missing；替代合约的关闭状态绝不用来判原合约。
+
+

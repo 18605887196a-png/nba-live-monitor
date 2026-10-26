@@ -456,8 +456,19 @@ def analyze(gid, slug, hm, state):
     # identified by its fixed contract (market/pick/line + condition),
     # never by "it is still in the main line list".
     tracked_evaluations = []
+    # Outer market views, captured once for review. _eval_tracked
+    # assigns ml/totals/spreads when it swaps in the original
+    # contract's price, which makes those names local to the function
+    # for EVERY path (Python scope rule). Without an explicit entry
+    # initialization, any read before that assignment -- the matched
+    # dict(totals) copy itself, and every unmatched/missing read --
+    # raised UnboundLocalError, wrapped as context_error. Each call
+    # starts from these outer views, so one signal can never pollute
+    # the next (totals/spreads are copied before any replacement).
+    _outer_ml, _outer_totals, _outer_spreads = ml, totals, spreads
     def _eval_tracked(sig):
         try:
+            ml = _outer_ml; totals = _outer_totals; spreads = _outer_spreads
             _mkt, _pick, _ln = sig.get("market"), sig.get("pick"), sig.get("line")
             # Kind must be read from the field register_tracked actually
             # writes. 69fbb1d records only carry original_kind; reading
@@ -576,7 +587,42 @@ def analyze(gid, slug, hm, state):
                                           for ln_, b_, a_ in spreads.get(_pick, [])]
             elif _sig_cond in _cond_set:
                 # Original contract present but no usable price this
-                # round: missing, never the replacement's price.
+                # round: identity, trade status and price are three
+                # separate facts. A closed original contract is CLOSED
+                # (not settled), a paused one is market_paused, and
+                # only a tradable original without a price is missing.
+                # The replacement's status is never used here.
+                _orig_trade = None
+                if _mkt == "ml":
+                    _orig_trade = ml_trade_by_condition.get(_sig_cond)
+                elif _mkt == "total":
+                    _orig_trade = totals_trade_by_condition.get(_tk, {}).get(_sig_cond)
+                elif _mkt == "spread":
+                    if _kind == "leak_plus" and _vs.get("original_team") is not None:
+                        _orig_trade = spreads_trade_by_condition.get(_vs["original_team"], {}).get(_vs["original_line"], {}).get(_sig_cond)
+                    else:
+                        _orig_trade = spreads_trade_by_condition.get(_pick, {}).get(_ln, {}).get(_sig_cond)
+                if _orig_trade == "closed":
+                    _dec_c = None
+                    if _NEW_MODULES:
+                        try:
+                            _dec_c = decide_candidate(
+                                {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
+                                 "kind": _kind, "raw_prob": None, "raw_price": None},
+                                {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                                 "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
+                                 "home_abbr": hab, "away_abbr": aab},
+                                process, None, None, market_closed=True)
+                        except Exception as _e:
+                            _dec_c = {"state": "CLOSED", "reason_codes": ["market_closed"],
+                                      "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+                    return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
+                            "kind": _kind, "threshold_at_send": float(_thresh) if _thresh is not None else None,
+                            "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                            "data_status": "closed", "decision": _dec_c,
+                            "evaluated_epoch": time.time()}
+                if _orig_trade in ("paused", "inactive"):
+                    return _identity_eval("paused", "market_paused")
                 return _identity_eval("missing", "data_missing")
             elif _cond_set:
                 return _identity_eval("identity_mismatch", "identity_mismatch")
