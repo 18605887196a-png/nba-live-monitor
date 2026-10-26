@@ -221,7 +221,8 @@ def parse_output(out):
         return "none", None, []
     first = lines[0]
     if first.startswith("DATA_ERROR"):
-        return "data_error", {"desc": "DATA_ERROR"}, []
+        _reason = first.split(":", 1)[0].split(" ", 1)[-1].strip() if ":" in first else "DATA_ERROR"
+        return "data_error", {"desc": "DATA_ERROR", "reason": _reason}, []
     m = re.match(r"^(\S+)@(\S+): (\S+) (\d+):(\d+)", first)
     if m:
         desc = m.group(3)
@@ -581,11 +582,14 @@ def main():
             log_msg(a.log, "STATUS final exit")
             return 0
         if status == "data_error":
-            # Clock/data broken this round: tracked signals are
-            # reported as clock_unknown REVIEW (held, never sent, never
-            # invalidated/closed), and pending confirmation is cleared
-            # so the next valid round must re-confirm from scratch.
+            # Data broken this round (clock_unknown, score_unknown, ...):
+            # tracked signals are reported as REVIEW (held, never sent,
+            # never invalidated/closed), and pending confirmation is
+            # cleared so the next valid round must re-confirm from
+            # scratch. The specific reason comes from the structured
+            # decision, not from assuming clock_unknown.
             _held = 0
+            _data_reason = (state or {}).get("reason") or "data_error"
             if structured:
                 _by_sid2 = {str(x.get("signal_id")): x for x in tracked if isinstance(x, dict)}
                 for _tev in structured.get("tracked_evaluations") or []:
@@ -593,11 +597,11 @@ def main():
                     if _ent is None:
                         continue
                     _td = _tev.get("decision") or {}
-                    if _td.get("state") == "REVIEW" and "clock_unknown" in (_td.get("reason_codes") or []):
+                    if _td.get("state") == "REVIEW" and (_td.get("reason_codes") or []):
                         _ent["last_state"] = "REVIEW"
-                        _ent["last_reason_codes"] = ["clock_unknown"]
+                        _ent["last_reason_codes"] = list(_td.get("reason_codes") or [])
                         _held += 1
-            log_msg(a.log, f"STATUS data_error clock_unknown tracked_held={_held} pending cleared")
+            log_msg(a.log, f"STATUS data_error {_data_reason} tracked_held={_held} pending cleared")
             prev = set(prev) - set(pending)
             pending = set()
             save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)

@@ -103,6 +103,26 @@ def Phi(x):
 def fmt_price(p):
     return f"{p*100:.0f}c(x{1/p:.2f})" if 0 < p < 1 else f"{p*100:.0f}c"
 
+
+def _parse_score(raw):
+    """Parse an ESPN score strictly: a legal 0 stays 0, while a
+    missing/null/empty/unparseable/negative value is None (unknown),
+    never silently repaired to 0. A 0 that is really 0:0 is unaffected."""
+    try:
+        if raw is None or isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw if raw >= 0 else None
+        if isinstance(raw, float):
+            return int(raw) if raw.is_integer() and raw >= 0 else None
+        s = str(raw).strip()
+        if not s:
+            return None
+        f = float(s)
+        return int(f) if f.is_integer() and f >= 0 else None
+    except Exception:
+        return None
+
 def analyze(gid, slug, hm, state):
     hs, as_, per, clk, hab, aab, desc = state
     # Only a live game is evaluated. Any other state (Scheduled, Delayed,
@@ -128,6 +148,65 @@ def analyze(gid, slug, hm, state):
                     and (not s.get("event_id") or str(s.get("event_id")) == str(gid))]
         except Exception:
             return []
+    def _error_evals(data_status):
+        _evals = []
+        for _sig in _load_tracked_raw():
+            _k2 = _sig.get("kind") or _sig.get("original_kind")
+            _dec2 = None
+            if _NEW_MODULES:
+                try:
+                    _dec2 = decide_candidate(
+                        {"event_id": str(gid), "market": _sig.get("market"), "pick": _sig.get("pick"),
+                         "line": _sig.get("line"), "kind": _k2, "raw_prob": None, "raw_price": None,
+                         "data_status": data_status},
+                        {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                         "lead": (hs - as_) if (hs is not None and as_ is not None) else None,
+                         "tot": (hs + as_) if (hs is not None and as_ is not None) else None,
+                         "elapsed_min": None, "remaining_min": None,
+                         "home_abbr": hab, "away_abbr": aab},
+                        None, None, None)
+                except Exception as _e:
+                    _dec2 = {"state": "REVIEW", "reason_codes": [data_status],
+                             "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+            _evals.append({"signal_id": _sig.get("signal_id"), "market": _sig.get("market"),
+                           "pick": _sig.get("pick"), "line": _sig.get("line"), "kind": _k2,
+                           "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                           "data_status": data_status, "decision": _dec2,
+                           "evaluated_epoch": time.time()})
+        return _evals
+
+    def _write_error_struct(status_field, status_value, evals):
+        _out_path = os.environ.get("FC_STRUCTURED_OUT")
+        if not _out_path:
+            return
+        try:
+            _struct = {"event_id": str(gid), "slug": slug, "status": "data_error",
+                       status_field: status_value,
+                       "game": {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                                "home_abbr": hab, "away_abbr": aab,
+                                "lead": (hs - as_) if (hs is not None and as_ is not None) else None,
+                                "tot": (hs + as_) if (hs is not None and as_ is not None) else None},
+                       "candidates_all": [], "tracked_evaluations": evals,
+                       "policy_version": POLICY_VERSION if _NEW_MODULES else "legacy",
+                       "model_version": MODEL_VERSION if _NEW_MODULES else "legacy",
+                       "scan_id": os.environ.get("FC_SCAN_ID"),
+                       "received_epoch": time.time()}
+            _tmp = _out_path + ".tmp"
+            with open(_tmp, "w") as _f:
+                json.dump(_struct, _f, ensure_ascii=False, default=str)
+            os.replace(_tmp, _out_path)
+        except Exception:
+            pass
+
+    # Score-missing / unparseable is a data error, never a fabricated 0
+    # (A): a missing away score with home 94 is not 0:94, and no new
+    # candidate, no history write and no settlement may follow from it.
+    # A real 0:0 parses to 0 and proceeds normally.
+    hs = _parse_score(hs)
+    as_ = _parse_score(as_)
+    if hs is None or as_ is None:
+        _write_error_struct("score_status", "score_unknown", _error_evals("score_unknown"))
+        return "DATA_ERROR score_unknown: score missing/unparseable"
     try:
         if clk is None or (isinstance(clk, str) and clk.strip() == ""):
             clock = None
@@ -146,46 +225,7 @@ def analyze(gid, slug, hm, state):
     # "no fresh file at all", and tracked signals are reported as
     # clock_unknown REVIEW -- never INVALIDATED, CLOSED or settled.
     if clock is None or clock < 0 or (per <= 4 and clock > 12.0) or (per >= 5 and clock > 5.0):
-        _clock_evals = []
-        for _sig in _load_tracked_raw():
-            _k2 = _sig.get("kind") or _sig.get("original_kind")
-            _dec2 = None
-            if _NEW_MODULES:
-                try:
-                    _dec2 = decide_candidate(
-                        {"event_id": str(gid), "market": _sig.get("market"), "pick": _sig.get("pick"),
-                         "line": _sig.get("line"), "kind": _k2, "raw_prob": None, "raw_price": None,
-                         "data_status": "clock_unknown"},
-                        {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
-                         "lead": hs - as_, "tot": hs + as_, "elapsed_min": None, "remaining_min": None,
-                         "home_abbr": hab, "away_abbr": aab},
-                        None, None, None)
-                except Exception as _e:
-                    _dec2 = {"state": "REVIEW", "reason_codes": ["clock_unknown"],
-                             "reasons_text": [f"复查异常：{type(_e).__name__}"]}
-            _clock_evals.append({"signal_id": _sig.get("signal_id"), "market": _sig.get("market"),
-                                 "pick": _sig.get("pick"), "line": _sig.get("line"), "kind": _k2,
-                                 "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
-                                 "data_status": "clock_unknown", "decision": _dec2,
-                                 "evaluated_epoch": time.time()})
-        _out_path = os.environ.get("FC_STRUCTURED_OUT")
-        if _out_path:
-            try:
-                _struct = {"event_id": str(gid), "slug": slug, "status": "data_error",
-                           "clock_status": "clock_unknown",
-                           "game": {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
-                                    "home_abbr": hab, "away_abbr": aab, "lead": hs - as_, "tot": hs + as_},
-                           "candidates_all": [], "tracked_evaluations": _clock_evals,
-                           "policy_version": POLICY_VERSION if _NEW_MODULES else "legacy",
-                           "model_version": MODEL_VERSION if _NEW_MODULES else "legacy",
-                           "scan_id": os.environ.get("FC_SCAN_ID"),
-                           "received_epoch": time.time()}
-                _tmp = _out_path + ".tmp"
-                with open(_tmp, "w") as _f:
-                    json.dump(_struct, _f, ensure_ascii=False, default=str)
-                os.replace(_tmp, _out_path)
-            except Exception:
-                pass
+        _write_error_struct("clock_status", "clock_unknown", _error_evals("clock_unknown"))
         return "DATA_ERROR clock_unknown: clock missing/unparseable/out of period"
     t = (4 - per) * 12 + clock if per <= 4 else clock
     # OT fix (2026-10-25 architecture, section 4.1): regulation 48 +
@@ -997,9 +1037,11 @@ def main():
             _raw_clk = None
         elif not isinstance(_raw_clk, str):
             _raw_clk = str(_raw_clk)
-        states[e['id']] = (int(comp['home'].get('score') or 0), int(comp['away'].get('score') or 0),
+        _ch = comp.get('home') or {}
+        _ca = comp.get('away') or {}
+        states[e['id']] = (_parse_score(_ch.get('score')), _parse_score(_ca.get('score')),
                            st.get('period'), _raw_clk,
-                           comp['home']['team']['abbreviation'], comp['away']['team']['abbreviation'],
+                           (_ch.get('team') or {}).get('abbreviation') or '', (_ca.get('team') or {}).get('abbreviation') or '',
                            st['type']['description'])
     with ThreadPoolExecutor(max_workers=len(specs)) as ex:
         futs = {ex.submit(analyze, gid, slug, hm, states[gid]): gid for gid, slug, hm in specs if gid in states}

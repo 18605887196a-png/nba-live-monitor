@@ -72,6 +72,7 @@ REASON_TEXT = {
     "inversion_no_longer_holds": "原倒挂已不再成立（较易线不再更便宜）",
     "tracked_kind_unknown": "跟踪记录类型未知，无法按原条件复查",
     "clock_unknown": "时钟缺失，暂无法核验",
+    "score_unknown": "比分缺失，暂无法核验",
     "market_paused": "市场暂停交易，暂不可交易",
     "comparison_market_closed": "比较市场已关闭/暂停，无法核验倒挂关系",
     "process_blowout_tail": "大比分领先进入收尾，胜负与让分须分开看",
@@ -130,6 +131,8 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
     # be evaluated.
     if candidate.get("data_status") == "clock_unknown":
         return _build(key, candidate, "REVIEW", ["clock_unknown"], ["clock"], cost)
+    if candidate.get("data_status") == "score_unknown":
+        return _build(key, candidate, "REVIEW", ["score_unknown"], ["score"], cost)
     # Paused market is REVIEW, not closed and not settled.
     if candidate.get("data_status") == "paused":
         return _build(key, candidate, "REVIEW", ["market_paused"], ["market_trade"], cost)
