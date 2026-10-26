@@ -241,6 +241,21 @@ def analyze(gid, slug, hm, state):
     totals_status, spreads_status = {}, {}
     ml_status = "unknown"
     ml_present = False
+    # Per-condition identity maps (2026-10-26): the same question/line
+    # can be carried by more than one contract. New candidates keep
+    # using the last-wins market, but tracked review must locate the
+    # ORIGINAL contract by condition_id, never the replacement.
+    ml_condition_set = set()
+    ml_by_condition, ml_trade_by_condition, ml_identity_by_condition = {}, {}, {}
+    totals_condition_set, totals_by_condition = {}, {}
+    totals_trade_by_condition, totals_identity_by_condition = {}, {}
+    spreads_condition_set, spreads_by_condition = {}, {}
+    spreads_trade_by_condition, spreads_identity_by_condition = {}, {}
+    def _cond_of(m):
+        try:
+            return m.get("conditionId", m.get("condition_id"))
+        except Exception:
+            return None
     blocked_markets = []
     def _mstatus(m):
         if _NEW_MODULES and trade_status_from_market is not None:
@@ -269,21 +284,37 @@ def analyze(gid, slug, hm, state):
                 team_names = []
             ml_present = True
             ml_status = _st
+            _c0 = _cond_of(m)
+            if _c0:
+                ml_condition_set.add(_c0)
+                ml_trade_by_condition[_c0] = _st
+                if b is not None and a is not None:
+                    ml_by_condition[_c0] = (b, a)
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "ml", "status": _st})
             if b is not None and a is not None:
                 ml = (b, a)
                 ml_id = parse_gamma_market(m) if _NEW_MODULES else None
+                if _c0:
+                    ml_identity_by_condition[_c0] = ml_id
         # Record trade status even for markets whose quote is
         # missing/dead: otherwise a closed market with no price would
         # be misread as "this round's data missing" in review.
         if ln is not None and 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
             totals_status[ln] = _st
+            _c1 = _cond_of(m)
+            if _c1:
+                totals_condition_set.setdefault(ln, set()).add(_c1)
+                totals_trade_by_condition.setdefault(ln, {})[_c1] = _st
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "total", "line": ln, "status": _st})
         if ln is not None and q.startswith('Spread:'):
             _team0 = q.replace('Spread: ', '').rsplit(' (', 1)[0]
             spreads_status.setdefault(_team0, {})[ln] = _st
+            _c2 = _cond_of(m)
+            if _c2:
+                spreads_condition_set.setdefault(_team0, {}).setdefault(ln, set()).add(_c2)
+                spreads_trade_by_condition.setdefault(_team0, {}).setdefault(ln, {})[_c2] = _st
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "spread", "pick": _team0, "line": ln, "status": _st})
         if ln is None or b is None or a is None or b <= 0.01 or a >= 0.999:
@@ -292,11 +323,19 @@ def analyze(gid, slug, hm, state):
             totals[ln] = (b, a)
             totals_id[ln] = parse_gamma_market(m) if _NEW_MODULES else None
             totals_status[ln] = _st
+            _c1 = _cond_of(m)
+            if _c1:
+                totals_by_condition.setdefault(ln, {})[_c1] = (b, a)
+                totals_identity_by_condition.setdefault(ln, {})[_c1] = totals_id[ln]
         if q.startswith('Spread:'):
             team = q.replace('Spread: ', '').rsplit(' (', 1)[0]
             spreads.setdefault(team, []).append((ln, b, a))
             spreads_id.setdefault(team, {})[ln] = parse_gamma_market(m) if _NEW_MODULES else None
             spreads_status.setdefault(team, {})[ln] = _st
+            _c2 = _cond_of(m)
+            if _c2:
+                spreads_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = (b, a)
+                spreads_identity_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = spreads_id[team][ln]
 
     hits, leaks = [], []
     # v1 structured candidates, built in parallel with the text lists
@@ -453,11 +492,103 @@ def analyze(gid, slug, hm, state):
                         "data_status": "unknown_kind", "base_condition_false": False,
                         "inversion_broken": False, "decision": _dec0,
                         "evaluated_epoch": time.time()}
+            # Identity gate (before trade/status/original-condition):
+            # locate the ORIGINAL contract by condition_id. If the
+            # recorded contract is absent while other contracts for
+            # the same line are present, that is a mismatch, not a
+            # price to borrow. If it is present but its price is
+            # unavailable, that is missing, not a mismatch. Old
+            # records without a condition_id are identity_unknown.
+            def _identity_eval(_ds, _rc):
+                _dec_i = None
+                if _NEW_MODULES:
+                    try:
+                        _dec_i = decide_candidate(
+                            {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
+                             "kind": _kind, "raw_prob": None, "raw_price": None, "data_status": _ds},
+                            {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                             "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
+                             "home_abbr": hab, "away_abbr": aab},
+                            process, None, None)
+                    except Exception as _e:
+                        _dec_i = {"state": "REVIEW", "reason_codes": [_rc],
+                                  "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+                return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
+                        "kind": _kind, "threshold_at_send": float(_thresh) if _thresh is not None else None,
+                        "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                        "data_status": _ds, "decision": _dec_i,
+                        "evaluated_epoch": time.time()}
+            _sig_cond = sig.get("condition_id")
+            _matched = False; _use_trade = None; _mkt_price = None
+            _cond_set = set()
+            _tk = None
+            if _mkt == "total":
+                try:
+                    _tk = float(_ln) if _ln is not None else None
+                except Exception:
+                    _tk = _ln
+            if _mkt == "ml":
+                _cond_set = set(ml_condition_set)
+                if _sig_cond and _sig_cond in ml_by_condition:
+                    _matched = True; _mkt_price = ml_by_condition[_sig_cond]
+                    _use_trade = ml_trade_by_condition.get(_sig_cond)
+            elif _mkt == "total":
+                _cond_set = set(totals_condition_set.get(_tk, set()))
+                if _sig_cond and _tk in totals_by_condition and _sig_cond in totals_by_condition[_tk]:
+                    _matched = True; _mkt_price = totals_by_condition[_tk][_sig_cond]
+                    _use_trade = totals_trade_by_condition.get(_tk, {}).get(_sig_cond)
+            elif _mkt == "spread":
+                if _kind == "leak_plus" and _vs.get("original_team") is not None:
+                    _ot, _ol = _vs["original_team"], _vs["original_line"]
+                    _cond_set = set(spreads_condition_set.get(_ot, {}).get(_ol, set()))
+                    if _sig_cond and _ol in spreads_by_condition.get(_ot, {}) and _sig_cond in spreads_by_condition[_ot][_ol]:
+                        _matched = True; _mkt_price = spreads_by_condition[_ot][_ol][_sig_cond]
+                        _use_trade = spreads_trade_by_condition.get(_ot, {}).get(_ol, {}).get(_sig_cond)
+                else:
+                    _cond_set = set(spreads_condition_set.get(_pick, {}).get(_ln, set()))
+                    if _sig_cond and _ln in spreads_by_condition.get(_pick, {}) and _sig_cond in spreads_by_condition[_pick][_ln]:
+                        _matched = True; _mkt_price = spreads_by_condition[_pick][_ln][_sig_cond]
+                        _use_trade = spreads_trade_by_condition.get(_pick, {}).get(_ln, {}).get(_sig_cond)
+            if not _sig_cond:
+                return _identity_eval("identity_unknown", "identity_unknown")
+            if _matched:
+                # Token identity for totals (the only market type
+                # whose tracked record carries an asset_id).
+                if _mkt == "total" and sig.get("asset_id") is not None and _NEW_MODULES and token_for_total is not None:
+                    try:
+                        _cur_asset = token_for_total(totals_identity_by_condition.get(_tk, {}).get(_sig_cond), _pick)
+                    except Exception:
+                        _cur_asset = None
+                    if _cur_asset is not None and _cur_asset != sig.get("asset_id"):
+                        return _identity_eval("identity_mismatch", "identity_mismatch")
+                if _mkt == "ml":
+                    ml = _mkt_price
+                elif _mkt == "total":
+                    totals = dict(totals); totals[_tk] = _mkt_price
+                elif _mkt == "spread":
+                    spreads = {k: list(v) for k, v in spreads.items()}
+                    if _kind == "leak_plus" and _vs.get("original_team") is not None:
+                        _ot, _ol = _vs["original_team"], _vs["original_line"]
+                        spreads[_ot] = [(ln_, b_, a_) if float(ln_) != float(_ol) else (_ol, _mkt_price[0], _mkt_price[1])
+                                        for ln_, b_, a_ in spreads.get(_ot, [])]
+                    else:
+                        spreads[_pick] = [(ln_, b_, a_) if float(ln_) != float(_ln) else (_ln, _mkt_price[0], _mkt_price[1])
+                                          for ln_, b_, a_ in spreads.get(_pick, [])]
+            elif _sig_cond in _cond_set:
+                # Original contract present but no usable price this
+                # round: missing, never the replacement's price.
+                return _identity_eval("missing", "data_missing")
+            elif _cond_set:
+                return _identity_eval("identity_mismatch", "identity_mismatch")
+            # else: no market object at all for this line -> fall
+            # through to the existing missing handling below.
             # Trade status gate for review: a closed market is
             # CLOSED (not settled, not a loss), a paused/inactive one
             # is REVIEW/paused, and both are distinct from missing.
             _trade = None; _trade_present = False
-            if _mkt == "ml":
+            if _matched and _use_trade is not None:
+                _trade = _use_trade; _trade_present = True
+            elif _mkt == "ml":
                 _trade_present = ml_present; _trade = ml_status
             elif _mkt == "total":
                 try:

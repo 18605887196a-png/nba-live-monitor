@@ -106,3 +106,8 @@ launch 任务 └─ worker 赛前备参数（slug / home_margin / 总分主线 
 - sender 断轮不拼接确认：data_error、waiting/none、fast_check 异常三类中断都清 pending（已发冷却与已推跟踪保留），恢复后必须重新连续确认；时钟恢复后正常推送恢复。中断时 pending 对应信号同时退出 prev，否则恢复后因“已见过”而永远不再重新确认（自查补丁）。
 - 市场可交易状态：gamma 的 closed/active/acceptingOrders 归一化为 closed/paused/inactive/ok/unknown，存入候选身份与结构化 blocked_markets。明确 closed/paused/inactive 不产生新普通/捡漏推荐，倒挂两边都必须可交易（比较线关闭则判比较市场不可用，不构造捡漏）；已推对象区分 closed（CLOSED，不结算）、paused（REVIEW 暂不可交易）、缺失（REVIEW 数据缺失）；市场恢复后按原确认/去重规则恢复，不永久屏蔽。字段缺失为 unknown，记录但不全拦；节点无够格线时若有 blocked 市场，附注“部分市场不可交易”，不携带已关闭市场的买入结论。
 
+## 窗口与合约身份补丁（2026-10-26，POLICY_VERSION = "v1-20261026-window-identity"）
+
+- 过程窗口断采：窗口只在真实采样通过时才算 full。基准离窗口起点偏差、窗口内相邻快照的比赛用时缺口超过 WINDOW_MAX_GAP_MIN（3 分钟，正常 45 秒一轮）时标 insufficient_coverage、记 history_gap，不出 2/5 分钟结论，仍按真实跨度展示观察到的变化，不插值。risk_tags 与 decision 只认 coverage_status=="full"，旧的 coverage>=1.0 兜底已删。暂停不误判：缺口按比赛用时算，暂停不推进比赛用时。
+- 复查锁原合约：解析时按 conditionId 建分合约映射；复查先比身份再比交易状态和原条件。原合约在则用原合约的报价与交易状态复查（含并存合约）；原合约在但无可用报价标数据缺失；原合约不在而同名其他合约在标 identity_mismatch；旧记录无 conditionId 标 identity_unknown；总分另核对已记录 token 身份。以上一律 REVIEW，不借用替代报价、不判失效、不判结算。跟踪主键本次未改，同名新合约独立跟踪为后续工作。
+

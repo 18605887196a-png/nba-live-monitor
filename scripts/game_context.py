@@ -22,9 +22,10 @@ import os
 import time
 
 try:
-    from policy_config import GAME_WINDOWS_MIN
+    from policy_config import GAME_WINDOWS_MIN, WINDOW_MAX_GAP_MIN
 except Exception:  # pragma: no cover - direct script execution fallback
     GAME_WINDOWS_MIN = (2, 5)
+    WINDOW_MAX_GAP_MIN = 3.0
 
 
 def Phi(x):
@@ -242,9 +243,32 @@ def window_features(history, current):
         home_delta = float(current.get("home_score", 0)) - float(base.get("home_score", 0))
         away_delta = float(current.get("away_score", 0)) - float(base.get("away_score", 0))
         tot_delta = float(current.get("tot", 0)) - float(base.get("tot", 0))
+        # Gap check (2026-10-26): a window is only "full" if it is
+        # actually sampled through. Base deviation from the window
+        # start, and every adjacent game-time gap inside the window
+        # (base -> ... -> current), must be within tolerance. A
+        # 10-minute span with only endpoints is an observed 10-minute
+        # change, never a 5-minute change; no interpolation is done.
+        # Pauses cannot trip this: they do not advance game elapsed,
+        # so they create no game-time gap.
+        _span_els = sorted([float(s.get("elapsed_min", 0.0)) for s in earlier
+                            if base_el <= float(s.get("elapsed_min", 0.0)) < cur_el] + [cur_el])
+        _gaps = [b - a for a, b in zip(_span_els, _span_els[1:])] if len(_span_els) > 1 else [delta]
+        _max_gap = max(_gaps) if _gaps else delta
+        _base_dev = (target - base_el) if base_el < target else 0.0
+        _insufficient = (_max_gap > WINDOW_MAX_GAP_MIN or _base_dev > WINDOW_MAX_GAP_MIN)
+        if coverage >= 1.0 and _insufficient:
+            _cov_status = "insufficient_coverage"
+        elif coverage >= 1.0:
+            _cov_status = "full"
+        else:
+            _cov_status = "insufficient_coverage" if _insufficient else "partial"
         out[w] = {
             "status": "ok",
-            "coverage_status": "full" if coverage >= 1.0 else "partial",
+            "coverage_status": _cov_status,
+            "history_gap": bool(_insufficient),
+            "max_gap_min": round(_max_gap, 3),
+            "base_deviation_min": round(_base_dev, 3),
             "actual_start_elapsed": base_el,
             "actual_delta_min": round(delta, 3),
             "coverage": coverage,
@@ -271,9 +295,10 @@ def risk_tags(current, windows, candidate=None):
     rem = float(current.get("remaining_min", 0.0))
     lead = float(current.get("lead", 0))
     w5 = windows.get(5, {}) if isinstance(windows, dict) else {}
-    # Full-window rule only: a partial window may be displayed as an
-    # observed change, but it must not trigger a "5-minute" threshold.
-    if w5.get("status") == "ok" and w5.get("coverage_status", "full" if w5.get("coverage", 0) >= 1.0 else "partial") == "full":
+    # Full-window rule only: a partial or insufficient-coverage
+    # window may be displayed as an observed change, but it must not
+    # trigger a "5-minute" threshold.
+    if w5.get("status") == "ok" and w5.get("coverage_status") == "full":
         lc = float(w5.get("lead_change", 0.0))
         # Lead moved toward zero by a notable amount in 5 game minutes.
         if abs(lead) < abs(lead - lc) and abs(lc) >= 5:

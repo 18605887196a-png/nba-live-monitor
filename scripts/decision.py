@@ -65,6 +65,8 @@ REASON_TEXT = {
     "spread_widening": "买卖价差明显扩大，流动性异常",
     "last_only_move": "只有旧成交价跳动，当前买卖报价未确认",
     "process_lead_narrowing": "近5分钟领先优势明显缩小，与候选方向相反",
+    "identity_mismatch": "原合约身份不符，无法按原合约复查",
+    "identity_unknown": "旧记录无合约身份，无法核实原合约",
     "probability_below_threshold": "模型概率已跌破推送门槛",
     "data_missing": "本轮行情缺失，无法确认原条件是否成立",
     "inversion_no_longer_holds": "原倒挂已不再成立（较易线不再更便宜）",
@@ -116,6 +118,13 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
     # rules and not a proven failure.
     if candidate.get("data_status") == "unknown_kind":
         return _build(key, candidate, "REVIEW", ["tracked_kind_unknown"], ["kind"], cost)
+    # Identity first: a mismatched or unverifiable contract is REVIEW,
+    # never evaluated on another contract's price, never CLOSED or
+    # settled on that basis.
+    if candidate.get("data_status") == "identity_mismatch":
+        return _build(key, candidate, "REVIEW", ["identity_mismatch"], ["contract_identity"], cost)
+    if candidate.get("data_status") == "identity_unknown":
+        return _build(key, candidate, "REVIEW", ["identity_unknown"], ["contract_identity"], cost)
     # Clock unknown is REVIEW, never INVALIDATED/CLOSED: a missing
     # clock proves nothing about the bet, only that this round cannot
     # be evaluated.
@@ -193,7 +202,7 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
             if process and isinstance(process, dict):
                 _wins = process.get("windows") or {}
                 _w5 = _wins.get(5, _wins.get("5", {})) if isinstance(_wins, dict) else {}
-            _cov_full = _w5.get("coverage_status") == "full" or _w5.get("coverage", 0) >= 1.0
+            _cov_full = _w5.get("coverage_status") == "full"
             _home_abbr = game.get("home_abbr") if isinstance(game, dict) else None
             _away_abbr = game.get("away_abbr") if isinstance(game, dict) else None
             _pick = candidate.get("pick")
@@ -317,10 +326,15 @@ def format_context_block(game, process, market_for_top, decision):
     if process and isinstance(process, dict):
         _pw = process.get("windows", {}) if isinstance(process.get("windows"), dict) else {}
         w5 = _pw.get(5, _pw.get("5", {}))
-        if w5.get("status") == "ok":
+        if w5.get("status") == "ok" and w5.get("coverage_status") == "full":
             lines.append(
                 f"过程：近5分钟领先变化 {w5.get('lead_change'):+.0f} 分，双方共得 {w5.get('tot_delta'):+.0f} 分，"
                 f"得分速度 {w5.get('scoring_pace_per_min')} 分/分钟（实际窗口 {w5.get('actual_delta_min')} 分钟，覆盖度 {w5.get('coverage')}）"
+            )
+        elif w5.get("status") == "ok" and w5.get("coverage_status") == "insufficient_coverage":
+            lines.append(
+                f"过程：实际观察 {w5.get('actual_delta_min')} 分钟内领先变化 {w5.get('lead_change'):+.0f} 分，双方共得 {w5.get('tot_delta'):+.0f} 分"
+                f"（采样不足，非完整5分钟窗口）"
             )
         else:
             lines.append("过程：未知（历史不足，刚启动或无上一快照）")

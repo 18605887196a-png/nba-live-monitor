@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261026-clock-closed"  # clock-missing -> data_error; explicit closed/paused markets block new pushes  # F1-F6: tracked review, Under quote fix, coverage-gated tags, scan_id
+POLICY_VERSION = "v1-20261026-window-identity"  # clock-missing -> data_error; explicit closed/paused markets block new pushes  # F1-F6: tracked review, Under quote fix, coverage-gated tags, scan_id
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime warning for totals (user 2026-10-26, inferred by assistant):
@@ -48,6 +48,12 @@ RISK_SEND_PROB_LEAK = 0.90
 
 # Game-process windows (game minutes, not wall minutes).
 GAME_WINDOWS_MIN = (2, 5)
+# Game-time sampling tolerance for process windows (2026-10-26):
+# sender polls ~45s, so adjacent game-time snapshots are normally
+# <=0.75 min apart. A gap above this tolerance means game time passed
+# without a snapshot (data gap, not a pause: pauses do not advance
+# game elapsed), so the window is NOT a full 2/5-minute observation.
+WINDOW_MAX_GAP_MIN = 3.0
 # A window is "covered" when we have a snapshot at or before its start.
 # With no history at all the window is unknown, never zero.
 WINDOW_MIN_COVERAGE = 1.0  # snapshot must reach the window start for full coverage
