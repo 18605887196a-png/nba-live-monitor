@@ -282,15 +282,21 @@ def analyze(gid, slug, hm, state):
     ml_status = "unknown"
     ml_present = False
     # Per-condition identity maps (2026-10-26): the same question/line
-    # can be carried by more than one contract. New candidates keep
-    # using the last-wins market, but tracked review must locate the
-    # ORIGINAL contract by condition_id, never the replacement.
+    # can be carried by more than one contract. Tracked review locates
+    # the ORIGINAL contract by condition_id, never the replacement.
+    # New candidates (B): every market object is collected per line and
+    # ONE object is selected (price, status, identity together), so a
+    # tradable replacement can never be paired with a closed contract's
+    # price, and vice versa. Selection prefers a tradable object with a
+    # valid price, then unknown, paused, inactive, closed.
     ml_condition_set = set()
     ml_by_condition, ml_trade_by_condition, ml_identity_by_condition = {}, {}, {}
     totals_condition_set, totals_by_condition = {}, {}
     totals_trade_by_condition, totals_identity_by_condition = {}, {}
     spreads_condition_set, spreads_by_condition = {}, {}
     spreads_trade_by_condition, spreads_identity_by_condition = {}, {}
+    # (B) Raw market objects per line, for one-object selection below.
+    ml_objs, totals_objs, spreads_objs = [], {}, {}
     def _cond_of(m):
         try:
             return m.get("conditionId", m.get("condition_id"))
@@ -323,25 +329,26 @@ def analyze(gid, slug, hm, state):
             except Exception:
                 team_names = []
             ml_present = True
-            ml_status = _st
             _c0 = _cond_of(m)
+            ml_objs.append({"bid": b, "ask": a, "status": _st, "condition": _c0,
+                            "identity": parse_gamma_market(m) if _NEW_MODULES else None,
+                            "index": len(ml_objs)})
             if _c0:
                 ml_condition_set.add(_c0)
                 ml_trade_by_condition[_c0] = _st
                 if b is not None and a is not None:
                     ml_by_condition[_c0] = (b, a)
+                    ml_identity_by_condition[_c0] = ml_objs[-1]["identity"]
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "ml", "status": _st})
-            if b is not None and a is not None:
-                ml = (b, a)
-                ml_id = parse_gamma_market(m) if _NEW_MODULES else None
-                if _c0:
-                    ml_identity_by_condition[_c0] = ml_id
         # Record trade status even for markets whose quote is
         # missing/dead: otherwise a closed market with no price would
         # be misread as "this round's data missing" in review.
         if ln is not None and 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
-            totals_status[ln] = _st
+            totals_objs.setdefault(ln, []).append({"bid": b, "ask": a, "status": _st,
+                                                   "condition": _cond_of(m),
+                                                   "identity": parse_gamma_market(m) if _NEW_MODULES else None,
+                                                   "index": len(totals_objs.get(ln, []))})
             _c1 = _cond_of(m)
             if _c1:
                 totals_condition_set.setdefault(ln, set()).add(_c1)
@@ -350,7 +357,10 @@ def analyze(gid, slug, hm, state):
                 blocked_markets.append({"market": "total", "line": ln, "status": _st})
         if ln is not None and q.startswith('Spread:'):
             _team0 = q.replace('Spread: ', '').rsplit(' (', 1)[0]
-            spreads_status.setdefault(_team0, {})[ln] = _st
+            spreads_objs.setdefault(_team0, {}).setdefault(ln, []).append(
+                {"bid": b, "ask": a, "status": _st, "condition": _cond_of(m),
+                 "identity": parse_gamma_market(m) if _NEW_MODULES else None,
+                 "index": len(spreads_objs.get(_team0, {}).get(ln, []))})
             _c2 = _cond_of(m)
             if _c2:
                 spreads_condition_set.setdefault(_team0, {}).setdefault(ln, set()).add(_c2)
@@ -360,22 +370,48 @@ def analyze(gid, slug, hm, state):
         if ln is None or b is None or a is None or b <= 0.01 or a >= 0.999:
             continue
         if 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
-            totals[ln] = (b, a)
-            totals_id[ln] = parse_gamma_market(m) if _NEW_MODULES else None
-            totals_status[ln] = _st
             _c1 = _cond_of(m)
             if _c1:
                 totals_by_condition.setdefault(ln, {})[_c1] = (b, a)
-                totals_identity_by_condition.setdefault(ln, {})[_c1] = totals_id[ln]
+                _tid = totals_objs[ln][-1]["identity"] if totals_objs.get(ln) else None
+                totals_identity_by_condition.setdefault(ln, {})[_c1] = _tid
         if q.startswith('Spread:'):
             team = q.replace('Spread: ', '').rsplit(' (', 1)[0]
-            spreads.setdefault(team, []).append((ln, b, a))
-            spreads_id.setdefault(team, {})[ln] = parse_gamma_market(m) if _NEW_MODULES else None
-            spreads_status.setdefault(team, {})[ln] = _st
             _c2 = _cond_of(m)
             if _c2:
                 spreads_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = (b, a)
-                spreads_identity_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = spreads_id[team][ln]
+                _sid = spreads_objs[team][ln][-1]["identity"] if spreads_objs.get(team, {}).get(ln) else None
+                spreads_identity_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = _sid
+
+    # (B) One-object selection: price, status and identity always come
+    # from the same market object. A closed object with a stale price
+    # can never lend its price to a tradable replacement (and a
+    # tradable replacement can never lend its status to a closed price).
+    _STATUS_RANK = {"ok": 0, "unknown": 1, "paused": 2, "inactive": 3, "closed": 4}
+    def _select(objs):
+        _valid = [o for o in objs if o["bid"] is not None and o["ask"] is not None
+                  and o["bid"] > 0.01 and o["ask"] < 0.999]
+        if not _valid:
+            return None
+        return min(_valid, key=lambda o: (_STATUS_RANK.get(o["status"], 1), o["index"]))
+    _sel = _select(ml_objs)
+    if _sel is not None:
+        ml = (_sel["bid"], _sel["ask"])
+        ml_id = _sel["identity"]
+        ml_status = _sel["status"]
+    for _ln, _objs in totals_objs.items():
+        _sel = _select(_objs)
+        if _sel is not None:
+            totals[_ln] = (_sel["bid"], _sel["ask"])
+            totals_id[_ln] = _sel["identity"]
+            totals_status[_ln] = _sel["status"]
+    for _team, _lines in spreads_objs.items():
+        for _ln, _objs in _lines.items():
+            _sel = _select(_objs)
+            if _sel is not None:
+                spreads.setdefault(_team, []).append((_ln, _sel["bid"], _sel["ask"]))
+                spreads_id.setdefault(_team, {})[_ln] = _sel["identity"]
+                spreads_status.setdefault(_team, {})[_ln] = _sel["status"]
 
     hits, leaks = [], []
     # v1 structured candidates, built in parallel with the text lists
