@@ -778,6 +778,10 @@ def main():
             # Candidates never sent before do not get a risk update here;
             # their context is already in the main/node message when sent.
             _risk_sent = False
+            _tracked_by_key = {}
+            for _tx in tracked:
+                if isinstance(_tx, dict):
+                    _tracked_by_key[(_tx.get("market"), _tx.get("pick"), _tx.get("line"), _tx.get("kind"))] = _tx
             if structured and _DECISION_OK:
                 for _c in structured.get("candidates_all") or []:
                     _dec = _c.get("decision") or {}
@@ -789,7 +793,13 @@ def main():
                     if _ckey not in sent_at:
                         continue
                     _skey = (_dec.get("kind") or _c.get("kind"), _c["market"], _c["pick"], _c["line"])
-                    if not should_send_risk(_ckey, _state_r, _reasons, risk_alerts):
+                    # Canonical risk key, shared with the tracked path
+                    # below: episode from the tracked entry (1 if the
+                    # entry is missing), so both paths dedup together.
+                    _centry = _tracked_by_key.get((_c["market"], _c["pick"], _c["line"], _skey[0]))
+                    _cep = int(_centry.get("episode") or 1) if _centry else 1
+                    _cbase = f"{_ckey}|{_skey[0]}|{_cep}"
+                    if not should_send_risk(_cbase, _state_r, _reasons, risk_alerts):
                         continue
                     # Priority gate (user 2026-10-26): risk is lowest priority.
                     # Early-game REVIEW is logged only, never sent, and never
@@ -809,7 +819,7 @@ def main():
                         except Exception:
                             pass
                         continue
-                    _alert_key = f"{_ckey}|{_state_r}|{','.join(sorted(_reasons))}"
+                    _alert_key = f"{_cbase}|{_state_r}|{','.join(sorted(_reasons))}"
                     _state_cn = "需复核" if _state_r == "REVIEW" else "原条件失效"
                     _reason_txt = "；".join(_dec.get("reasons_text") or _reasons)
                     _risk_msg = (f"{state_line(state)}\n\n风险更新：{fmt_main(_skey, {'price': _c.get('raw_price') * 100 if _c.get('raw_price') is not None else None, 'prob': (_c.get('raw_prob') * 100 if _c.get('raw_prob') is not None else None), 'text': _c.get('text', '')}, False, state['ot'])}\n"
@@ -817,6 +827,8 @@ def main():
                     if a.dry_run:
                         log_msg(a.log, "DRY-RUN risk would send:\n" + _risk_msg)
                         risk_alerts[_alert_key] = time.time()
+                        if _centry is not None:
+                            _centry["last_alert_episode"] = _cep
                         _risk_sent = True
                     else:
                         _ok = tg_send(_risk_msg, a.chat)
@@ -824,6 +836,8 @@ def main():
                         if _ok:
                             log_msg(a.log, "SENT_RISK_MSG:\n" + _risk_msg)
                             risk_alerts[_alert_key] = time.time()
+                            if _centry is not None:
+                                _centry["last_alert_episode"] = _cep
                             try:
                                 sys.path.insert(0, FC_DIR)
                                 import experience as _exp
@@ -865,7 +879,11 @@ def main():
                     if not risk_send_allowed(_tstate, _tev.get("kind"), _tev.get("raw_prob"), _game_ctx2):
                         log_msg(a.log, f"RISK held (tracked, priority gate) {_sid} {_tstate} period={per} reasons={','.join(_treasons)}")
                         continue
-                    _talert = f"{_sid}|{_entry.get('episode')}|{_tstate}|{','.join(sorted(_treasons))}"
+                    # Same canonical key as the candidate path above
+                    # (market|pick|line|kind|episode|state|reasons), so a
+                    # reason already sent via either path is not sent
+                    # again for the same episode.
+                    _talert = f"{_tev.get('market')}|{_tev.get('pick')}|{_tev.get('line')}|{_tev.get('kind')}|{(_entry.get('episode') or 1)}|{_tstate}|{','.join(sorted(_treasons))}"
                     if _talert in risk_alerts:
                         continue
                     _tkey = (_tev.get("kind"), _tev.get("market"), _tev.get("pick"), _tev.get("line"))
