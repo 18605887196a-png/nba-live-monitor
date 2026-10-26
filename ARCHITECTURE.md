@@ -100,3 +100,9 @@ launch 任务 └─ worker 赛前备参数（slug / home_margin / 总分主线 
 - 倒挂失效有具体理由：总分/受让捡漏比较线证明不再更便宜时，判 INVALIDATED + `inversion_no_longer_holds`（同时保留 `base_condition_false`）。
 - 总分捡漏不套距线：距线 ≥10 分只对总分 hit 检查，leak 不检查；69fbb1d 已写入的旧 leak 记录（min_margin=10、只有 original_kind）按类型重新解释，不用迁移文件，快照不变不再报失效。
 
+## 时钟与市场关闭补丁（2026-10-26，POLICY_VERSION = "v1-20261026-clock-closed"）
+
+- 时钟缺失不再补 0:00：main() 原样传 displayClock，缺失/null/空串/非法/超节长时 analyze() 返回 DATA_ERROR + 本轮 data_error 结构化（scan_id/event_id 齐全），不算概率、不发新机会；真实 0:00 照常处理。已推对象本轮标 clock_unknown（需复核、只记不发），不判失效、不判终场、不结算。
+- sender 断轮不拼接确认：data_error、waiting/none、fast_check 异常三类中断都清 pending（已发冷却与已推跟踪保留），恢复后必须重新连续确认；时钟恢复后正常推送恢复。
+- 市场可交易状态：gamma 的 closed/active/acceptingOrders 归一化为 closed/paused/inactive/ok/unknown，存入候选身份与结构化 blocked_markets。明确 closed/paused/inactive 不产生新普通/捡漏推荐，倒挂两边都必须可交易（比较线关闭则判比较市场不可用，不构造捡漏）；已推对象区分 closed（CLOSED，不结算）、paused（REVIEW 暂不可交易）、缺失（REVIEW 数据缺失）；市场恢复后按原确认/去重规则恢复，不永久屏蔽。字段缺失为 unknown，记录但不全拦；节点无够格线时若有 blocked 市场，附注“部分市场不可交易”，不携带已关闭市场的买入结论。
+

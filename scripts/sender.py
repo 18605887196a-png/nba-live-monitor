@@ -213,12 +213,15 @@ def fmt_spread_attach(key, info):
     return f"{cn(pick)} {line:+.1f} @ {price:.0f}¢ 覆盖 {prob:.0f}%"
 
 def parse_output(out):
-    """Return (status, state, items). status: live/waiting/final/none.
-    items: list of (key, info) in display order (leaks first, then hits)."""
+    """Return (status, state, items). status: live/waiting/final/
+    data_error/none. items: list of (key, info) in display order
+    (leaks first, then hits)."""
     lines = [l for l in out.splitlines() if l.strip()]
     if not lines:
         return "none", None, []
     first = lines[0]
+    if first.startswith("DATA_ERROR"):
+        return "data_error", {"desc": "DATA_ERROR"}, []
     m = re.match(r"^(\S+)@(\S+): (\S+) (\d+):(\d+)", first)
     if m:
         desc = m.group(3)
@@ -555,7 +558,13 @@ def main():
                                  structured_path=_structured_path, target_usd=a.target_usd,
                                  scan_id=_scan_id, tracked_path=_tracked_path)
         except Exception as e:
-            log_msg(a.log, f"FAST_CHECK ERROR {type(e).__name__}")
+            # A failed round must not be stitched to the next valid
+            # round as a "second confirmation": clear pending, keep
+            # sent_at (cooldown) and tracked (still registered, not
+            # invalidated) intact.
+            log_msg(a.log, f"FAST_CHECK ERROR {type(e).__name__} pending cleared")
+            pending = set()
+            save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
             if a.once:
                 return 0
             time.sleep(a.interval)
@@ -570,8 +579,34 @@ def main():
         if status == "final":
             log_msg(a.log, "STATUS final exit")
             return 0
+        if status == "data_error":
+            # Clock/data broken this round: tracked signals are
+            # reported as clock_unknown REVIEW (held, never sent, never
+            # invalidated/closed), and pending confirmation is cleared
+            # so the next valid round must re-confirm from scratch.
+            _held = 0
+            if structured:
+                _by_sid2 = {str(x.get("signal_id")): x for x in tracked if isinstance(x, dict)}
+                for _tev in structured.get("tracked_evaluations") or []:
+                    _ent = _by_sid2.get(str(_tev.get("signal_id")))
+                    if _ent is None:
+                        continue
+                    _td = _tev.get("decision") or {}
+                    if _td.get("state") == "REVIEW" and "clock_unknown" in (_td.get("reason_codes") or []):
+                        _ent["last_state"] = "REVIEW"
+                        _ent["last_reason_codes"] = ["clock_unknown"]
+                        _held += 1
+            log_msg(a.log, f"STATUS data_error clock_unknown tracked_held={_held} pending cleared")
+            pending = set()
+            save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
+            if a.once:
+                return 0
+            time.sleep(a.interval)
+            continue
         if status != "live":
-            log_msg(a.log, f"STATUS {status} waiting")
+            log_msg(a.log, f"STATUS {status} waiting pending cleared")
+            pending = set()
+            save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
             if a.once:
                 return 0
             time.sleep(a.interval)
@@ -623,7 +658,8 @@ def main():
                 if _ctx:
                     node_msg = node_msg + "\n\n" + _ctx
             else:
-                node_msg = f"{label}{state_line(state)}，暂无够格线"
+                _blocked_note = "（部分市场不可交易）" if (structured and structured.get("blocked_markets")) else ""
+                node_msg = f"{label}{state_line(state)}，暂无够格线{_blocked_note}"
                 # Node with no qualified line still gets process context
                 # when structured data is available (no candidate, no cost).
                 if structured and _DECISION_OK:
@@ -813,7 +849,7 @@ def main():
                     if "tracked_kind_unknown" in _treasons:
                         log_msg(a.log, f"RISK held (tracked, unknown kind) {_sid} {_tstate} reasons={','.join(_treasons)}")
                         continue
-                    if _tstate == "WATCH" and _entry.get("last_state") in ("REVIEW", "INVALIDATED"):
+                    if _tstate == "WATCH" and _entry.get("last_state") in ("REVIEW", "INVALIDATED", "CLOSED"):
                         _entry["episode"] = int(_entry.get("episode") or 1) + 1
                         _entry["last_state"] = "WATCH"
                         _entry["last_reason_codes"] = []

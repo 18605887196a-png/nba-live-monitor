@@ -72,7 +72,53 @@ def parse_gamma_market(m):
         "last": m.get("lastTradePrice"),
         "token_ids": tokens,
         "outcomes": outcomes,
+        "trade_status": trade_status_from_market(m),
     }
+
+
+def trade_status_from_market(m):
+    """Normalize a gamma market's tradability into one status string.
+
+    closed:        closed is True -> never a new recommendation.
+    paused:        acceptingOrders is False -> temporarily not tradable.
+    inactive:      active is False (and not already closed/paused).
+    ok:            closed is False, active is True, acceptingOrders is True.
+    unknown:       none of the fields is present/usable -> NOT a proof
+                   of tradability, and NOT a proof of closure. Callers
+                   must record it as unknown; new-candidate filtering
+                   treats unknown as allowed only because gamma has
+                   historically omitted these fields on some markets,
+                   and blocking every unknown market would stop all
+                   pushes. Explicit closed/paused/inactive always block.
+    Returns {"closed":..., "active":..., "accepting_orders":...,
+             "status":...} with raw values preserved (or None).
+    """
+    if not isinstance(m, dict):
+        return {"closed": None, "active": None, "accepting_orders": None, "status": "unknown"}
+    closed = m.get("closed")
+    active = m.get("active")
+    acc = m.get("acceptingOrders", m.get("accepting_orders"))
+    if closed is True:
+        status = "closed"
+    elif acc is False:
+        status = "paused"
+    elif active is False:
+        status = "inactive"
+    elif closed is False and active is True and acc is True:
+        status = "ok"
+    else:
+        status = "unknown"
+    return {"closed": closed, "active": active, "accepting_orders": acc, "status": status}
+
+
+def tradable_for_new(status):
+    """Whether a status may generate a NEW recommendation.
+
+    Only explicit closed/paused/inactive block. Unknown is allowed
+    (see trade_status_from_market) so a missing field cannot silently
+    kill every push; it is recorded as unknown in the candidate.
+    """
+    return status in ("ok", "unknown")
 
 
 def token_for_total(identity, pick):

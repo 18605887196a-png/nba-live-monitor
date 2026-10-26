@@ -69,6 +69,9 @@ REASON_TEXT = {
     "data_missing": "本轮行情缺失，无法确认原条件是否成立",
     "inversion_no_longer_holds": "原倒挂已不再成立（较易线不再更便宜）",
     "tracked_kind_unknown": "跟踪记录类型未知，无法按原条件复查",
+    "clock_unknown": "时钟缺失，暂无法核验",
+    "market_paused": "市场暂停交易，暂不可交易",
+    "comparison_market_closed": "比较市场已关闭/暂停，无法核验倒挂关系",
     "process_blowout_tail": "大比分领先进入收尾，胜负与让分须分开看",
     "process_close_late": "比分接近进入末节，可能进入犯规阶段",
     "cost_unverifiable_target": "已设目标金额但订单簿不足，无法确认全额成本",
@@ -113,6 +116,19 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
     # rules and not a proven failure.
     if candidate.get("data_status") == "unknown_kind":
         return _build(key, candidate, "REVIEW", ["tracked_kind_unknown"], ["kind"], cost)
+    # Clock unknown is REVIEW, never INVALIDATED/CLOSED: a missing
+    # clock proves nothing about the bet, only that this round cannot
+    # be evaluated.
+    if candidate.get("data_status") == "clock_unknown":
+        return _build(key, candidate, "REVIEW", ["clock_unknown"], ["clock"], cost)
+    # Paused market is REVIEW, not closed and not settled.
+    if candidate.get("data_status") == "paused":
+        return _build(key, candidate, "REVIEW", ["market_paused"], ["market_trade"], cost)
+    # Comparison market closed/paused: the inversion relation cannot
+    # be verified this round, but the target market itself is not
+    # thereby proven invalid.
+    if candidate.get("data_status") == "comparison_unavailable":
+        return _build(key, candidate, "REVIEW", ["comparison_market_closed"], ["comparison_market"], cost)
     # Tracked original condition: a reliable new probability below the
     # threshold at send time means the original push condition no
     # longer holds. This is INVALIDATED in the decision sense only;

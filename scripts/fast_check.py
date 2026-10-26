@@ -24,7 +24,8 @@ DATE_US = None  # set by main(); used as the experience-bank date key
 try:
     from game_context import window_features, risk_tags, SnapshotHistory
     from market_context import (MarketHistory, market_window_features, parse_gamma_market,
-                                cost_for_target, normalize_under_quote, token_for_total, fetch_book)
+                                cost_for_target, normalize_under_quote, token_for_total, fetch_book,
+                                trade_status_from_market, tradable_for_new)
     from decision import decide_candidate
     from policy_config import (POLICY_VERSION, MODEL_VERSION, HIT_PROB, LEAK_PROB,
                                Q4_HIT_LATE_REMAINING_MIN, Q4_HIT_BLOWOUT_LEAD,
@@ -34,6 +35,8 @@ try:
     _NEW_MODULES = True
 except Exception:
     _NEW_MODULES = False
+    trade_status_from_market = None
+    tradable_for_new = lambda s: s in ("ok", "unknown")
     HIT_PROB, LEAK_PROB = 0.95, 0.90
     Q4_HIT_LATE_REMAINING_MIN, Q4_HIT_BLOWOUT_LEAD = 5.0, 30
     TOTALS_MIN_ELAPSED_MIN, TOTALS_MIN_MARGIN = 15, 10
@@ -109,17 +112,81 @@ def analyze(gid, slug, hm, state):
     # Halftime counts as live: real score, 24 min remaining, no fabrication.
     if desc not in ('In Progress', 'Halftime') or per is None:
         return f"{aab}@{hab}: {desc} {as_}:{hs}"
+    def _load_tracked_raw():
+        try:
+            _tp = os.environ.get("FC_TRACKED_FILE")
+            if _tp and os.path.exists(_tp):
+                with open(_tp) as _tf:
+                    _raw = json.load(_tf)
+            elif os.environ.get("FC_TRACKED_JSON"):
+                _raw = json.loads(os.environ.get("FC_TRACKED_JSON") or "[]")
+            else:
+                return []
+            if isinstance(_raw, dict):
+                _raw = _raw.get("tracked_signals") or _raw.get("signals") or []
+            return [s for s in (_raw or []) if isinstance(s, dict)
+                    and (not s.get("event_id") or str(s.get("event_id")) == str(gid))]
+        except Exception:
+            return []
     try:
-        if ':' in clk:
+        if clk is None or (isinstance(clk, str) and clk.strip() == ""):
+            clock = None
+        elif ':' in clk:
             mm, ss = clk.split(':'); clock = float(mm) + float(ss) / 60
         else:
             clock = float(clk) / 60  # ESPN shows bare seconds ("43.5") under a minute
     except Exception:
         clock = None
-    # F4: an unparseable or out-of-period clock is a data error, never
-    # a fabricated 0.0 (which would look like period end / a final).
+    # Clock-missing / unparseable / out-of-period is a data error,
+    # never a fabricated 0.0 (which would look like period end / a
+    # final). A real "0:00" parses to 0.0 and proceeds normally; only
+    # a missing/unparseable value lands here. The structured file for
+    # THIS scan is still written (status=data_error, scan_id intact)
+    # so the sender can distinguish "this round is broken" from
+    # "no fresh file at all", and tracked signals are reported as
+    # clock_unknown REVIEW -- never INVALIDATED, CLOSED or settled.
     if clock is None or clock < 0 or (per <= 4 and clock > 12.0) or (per >= 5 and clock > 5.0):
-        return "DATA_ERROR clock unparseable or out of period"
+        _clock_evals = []
+        for _sig in _load_tracked_raw():
+            _k2 = _sig.get("kind") or _sig.get("original_kind")
+            _dec2 = None
+            if _NEW_MODULES:
+                try:
+                    _dec2 = decide_candidate(
+                        {"event_id": str(gid), "market": _sig.get("market"), "pick": _sig.get("pick"),
+                         "line": _sig.get("line"), "kind": _k2, "raw_prob": None, "raw_price": None,
+                         "data_status": "clock_unknown"},
+                        {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                         "lead": hs - as_, "tot": hs + as_, "elapsed_min": None, "remaining_min": None,
+                         "home_abbr": hab, "away_abbr": aab},
+                        None, None, None)
+                except Exception as _e:
+                    _dec2 = {"state": "REVIEW", "reason_codes": ["clock_unknown"],
+                             "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+            _clock_evals.append({"signal_id": _sig.get("signal_id"), "market": _sig.get("market"),
+                                 "pick": _sig.get("pick"), "line": _sig.get("line"), "kind": _k2,
+                                 "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                                 "data_status": "clock_unknown", "decision": _dec2,
+                                 "evaluated_epoch": time.time()})
+        _out_path = os.environ.get("FC_STRUCTURED_OUT")
+        if _out_path:
+            try:
+                _struct = {"event_id": str(gid), "slug": slug, "status": "data_error",
+                           "clock_status": "clock_unknown",
+                           "game": {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                                    "home_abbr": hab, "away_abbr": aab, "lead": hs - as_, "tot": hs + as_},
+                           "candidates_all": [], "tracked_evaluations": _clock_evals,
+                           "policy_version": POLICY_VERSION if _NEW_MODULES else "legacy",
+                           "model_version": MODEL_VERSION if _NEW_MODULES else "legacy",
+                           "scan_id": os.environ.get("FC_SCAN_ID"),
+                           "received_epoch": time.time()}
+                _tmp = _out_path + ".tmp"
+                with open(_tmp, "w") as _f:
+                    json.dump(_struct, _f, ensure_ascii=False, default=str)
+                os.replace(_tmp, _out_path)
+            except Exception:
+                pass
+        return "DATA_ERROR clock_unknown: clock missing/unparseable/out of period"
     t = (4 - per) * 12 + clock if per <= 4 else clock
     # OT fix (2026-10-25 architecture, section 4.1): regulation 48 +
     # (OT-1)*5 + OT elapsed, never 48 - OT remaining. Regulation games
@@ -168,26 +235,68 @@ def analyze(gid, slug, hm, state):
     title = ev['title']
     totals, spreads, ml = {}, {}, None
     totals_id, spreads_id, ml_id = {}, {}, None
+    # Trade status is recorded for EVERY market object, even when its
+    # bid/ask is missing or dead: tracked evaluation must be able to
+    # tell "closed" / "paused" apart from "this round's data missing".
+    totals_status, spreads_status = {}, {}
+    ml_status = "unknown"
+    ml_present = False
+    blocked_markets = []
+    def _mstatus(m):
+        if _NEW_MODULES and trade_status_from_market is not None:
+            try:
+                return trade_status_from_market(m)["status"]
+            except Exception:
+                return "unknown"
+        try:
+            if m.get("closed") is True:
+                return "closed"
+            if m.get("acceptingOrders", m.get("accepting_orders")) is False:
+                return "paused"
+            if m.get("active") is False:
+                return "inactive"
+            return "unknown"
+        except Exception:
+            return "unknown"
     team_names = []
     for m in ev['markets']:
         q = m.get('question', ''); b = m.get('bestBid'); a = m.get('bestAsk'); ln = m.get('line')
+        _st = _mstatus(m)
         if q == title:
             try:
                 team_names = json.loads(m.get('outcomes') or '[]')
             except Exception:
                 team_names = []
+            ml_present = True
+            ml_status = _st
+            if _st in ("closed", "paused", "inactive"):
+                blocked_markets.append({"market": "ml", "status": _st})
             if b is not None and a is not None:
                 ml = (b, a)
                 ml_id = parse_gamma_market(m) if _NEW_MODULES else None
+        # Record trade status even for markets whose quote is
+        # missing/dead: otherwise a closed market with no price would
+        # be misread as "this round's data missing" in review.
+        if ln is not None and 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
+            totals_status[ln] = _st
+            if _st in ("closed", "paused", "inactive"):
+                blocked_markets.append({"market": "total", "line": ln, "status": _st})
+        if ln is not None and q.startswith('Spread:'):
+            _team0 = q.replace('Spread: ', '').rsplit(' (', 1)[0]
+            spreads_status.setdefault(_team0, {})[ln] = _st
+            if _st in ("closed", "paused", "inactive"):
+                blocked_markets.append({"market": "spread", "pick": _team0, "line": ln, "status": _st})
         if ln is None or b is None or a is None or b <= 0.01 or a >= 0.999:
             continue
         if 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
             totals[ln] = (b, a)
             totals_id[ln] = parse_gamma_market(m) if _NEW_MODULES else None
+            totals_status[ln] = _st
         if q.startswith('Spread:'):
             team = q.replace('Spread: ', '').rsplit(' (', 1)[0]
             spreads.setdefault(team, []).append((ln, b, a))
             spreads_id.setdefault(team, {})[ln] = parse_gamma_market(m) if _NEW_MODULES else None
+            spreads_status.setdefault(team, {})[ln] = _st
 
     hits, leaks = [], []
     # v1 structured candidates, built in parallel with the text lists
@@ -202,7 +311,7 @@ def analyze(gid, slug, hm, state):
                       "ask": float(ask) if ask is not None else None,
                       "text": text, "identity": identity, "ot_warning": ot_warning,
                       "leak_vs": leak_vs})
-    if ml and sd_m:
+    if ml and sd_m and tradable_for_new(ml_status):
         if hit_ok and 1 - wp_home >= HIT_PROB:
             hits.append((1 - wp_home, f"ML {aab} ask {fmt_price(ml[1])} prob {(1-wp_home)*100:.0f}%"))
             _add_cand("ml", aab, None, "hit", 1 - wp_home, ml[1], ml[0], ml[1], f"ML {aab} ask {fmt_price(ml[1])} prob {(1-wp_home)*100:.0f}%", ml_id)
@@ -217,13 +326,15 @@ def analyze(gid, slug, hm, state):
             if sd_m:
                 p = Phi((mean_m + ln) / sd_m)
                 cover[(team, ln)] = (p, a)
+                if not tradable_for_new(spreads_status.get(team, {}).get(ln, "unknown")):
+                    continue
                 if hit_ok and p >= HIT_PROB:
                     hits.append((p, f"Spread {team} ({ln:+.1f}) ask {fmt_price(a)} cover {p*100:.0f}%"))
                     _add_cand("spread", team, ln, "hit", p, a, b, a, f"Spread {team} ({ln:+.1f}) ask {fmt_price(a)} cover {p*100:.0f}%", spreads_id.get(team, {}).get(ln))
                 # Plus-line flip (user, 2026-10-24): the No side of a negative spread line is the
                 # other team GETTING points (No on Clippers -3.5 == Lakers +3.5). It strictly
                 # dominates that team's moneyline, so ask <= ML ask at prob >= 90% = top leak.
-                if ln < 0 and ml and len(team_names) == 2 and b and b >= 0.02:
+                if ln < 0 and ml and tradable_for_new(ml_status) and len(team_names) == 2 and b and b >= 0.02:
                     other = team_names[1] if team == team_names[0] else team_names[0]
                     p_no = 1 - p
                     ask_no = 1 - b
@@ -232,6 +343,8 @@ def analyze(gid, slug, hm, state):
                         leaks.append(f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%")
                         _add_cand("spread", other, -ln, "leak_plus", p_no, ask_no, 1 - a, ask_no, f"LEAK Plus {other} ({-ln:+.1f}) ask {fmt_price(ask_no)} vs ML {fmt_price(ml_a)}: easier than ML, cheaper-or-equal, prob {p_no*100:.0f}%", spreads_id.get(team, {}).get(ln), leak_vs={"original_team": team, "original_line": ln, "ml_ask": ml_a, "side": "spread_no"})
     for ln, (b, a) in totals.items():
+        if not tradable_for_new(totals_status.get(ln, "unknown")):
+            continue
         p_over = Phi((mu - ln) / sd_t)
         if hit_ok and totals_ok and p_over >= HIT_PROB and mu - ln >= TOTALS_MIN_MARGIN:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
@@ -243,6 +356,8 @@ def analyze(gid, slug, hm, state):
     ls = sorted(totals)
     for i in range(len(ls) - 1):
         l1, l2 = ls[i], ls[i + 1]
+        if not (tradable_for_new(totals_status.get(l1, "unknown")) and tradable_for_new(totals_status.get(l2, "unknown"))):
+            continue
         ua1, ua2 = 1 - totals[l1][0], 1 - totals[l2][0]
         oa1, oa2 = totals[l1][1], totals[l2][1]
         if ua2 < ua1 - 0.005:
@@ -261,6 +376,8 @@ def analyze(gid, slug, hm, state):
         for i in range(len(arr2) - 1):
             ln1, b1, a1 = arr2[i]
             ln2, b2, a2 = arr2[i + 1]
+            if not (tradable_for_new(spreads_status.get(team, {}).get(ln1, "unknown")) and tradable_for_new(spreads_status.get(team, {}).get(ln2, "unknown"))):
+                continue
             if a2 < a1 - 0.005:
                 p = cover.get((team, ln2), (0, 0))[0]
                 if p >= 0.90:
@@ -336,6 +453,63 @@ def analyze(gid, slug, hm, state):
                         "data_status": "unknown_kind", "base_condition_false": False,
                         "inversion_broken": False, "decision": _dec0,
                         "evaluated_epoch": time.time()}
+            # Trade status gate for review: a closed market is
+            # CLOSED (not settled, not a loss), a paused/inactive one
+            # is REVIEW/paused, and both are distinct from missing.
+            _trade = None; _trade_present = False
+            if _mkt == "ml":
+                _trade_present = ml_present; _trade = ml_status
+            elif _mkt == "total":
+                try:
+                    _tk = float(_ln) if _ln is not None else None
+                except Exception:
+                    _tk = _ln
+                _trade_present = _tk in totals_status; _trade = totals_status.get(_tk)
+            elif _mkt == "spread":
+                if _kind == "leak_plus" and _vs.get("original_team") is not None:
+                    _trade_present = _vs.get("original_line") in spreads_status.get(_vs.get("original_team"), {})
+                    _trade = spreads_status.get(_vs.get("original_team"), {}).get(_vs.get("original_line"))
+                else:
+                    _trade_present = _ln in spreads_status.get(_pick, {})
+                    _trade = spreads_status.get(_pick, {}).get(_ln)
+            if _trade_present and _trade == "closed":
+                _dec_c = None
+                if _NEW_MODULES:
+                    try:
+                        _dec_c = decide_candidate(
+                            {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
+                             "kind": _kind, "raw_prob": None, "raw_price": None},
+                            {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                             "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
+                             "home_abbr": hab, "away_abbr": aab},
+                            process, None, None, market_closed=True)
+                    except Exception as _e:
+                        _dec_c = {"state": "CLOSED", "reason_codes": ["market_closed"],
+                                  "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+                return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
+                        "kind": _kind, "threshold_at_send": float(_thresh) if _thresh is not None else None,
+                        "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                        "data_status": "closed", "decision": _dec_c,
+                        "evaluated_epoch": time.time()}
+            if _trade_present and _trade in ("paused", "inactive"):
+                _dec_p = None
+                if _NEW_MODULES:
+                    try:
+                        _dec_p = decide_candidate(
+                            {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
+                             "kind": _kind, "raw_prob": None, "raw_price": None, "data_status": "paused"},
+                            {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                             "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
+                             "home_abbr": hab, "away_abbr": aab},
+                            process, None, None)
+                    except Exception as _e:
+                        _dec_p = {"state": "REVIEW", "reason_codes": ["market_paused"],
+                                  "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+                return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
+                        "kind": _kind, "threshold_at_send": float(_thresh) if _thresh is not None else None,
+                        "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                        "data_status": "paused", "decision": _dec_p,
+                        "evaluated_epoch": time.time()}
             if _mkt == "ml" and ml and sd_m:
                 _is_home = (_pick == hab) or (team_names and len(team_names) == 2 and _pick == team_names[1])
                 _is_away = (_pick == aab) or (team_names and len(team_names) == 2 and _pick == team_names[0])
@@ -347,12 +521,16 @@ def analyze(gid, slug, hm, state):
                     _data_status = "missing"
             elif _mkt == "spread":
                 if _kind == "leak_plus" and _vs.get("original_team") and _vs.get("original_line") is not None:
+                    if ml_present and ml_status in ("closed", "paused", "inactive"):
+                        _data_status = "comparison_unavailable"
                     _ot_team, _ot_ln = _vs["original_team"], _vs["original_line"]
                     _found = None
                     for _ln2, _b2, _a2 in spreads.get(_ot_team, []):
                         if float(_ln2) == float(_ot_ln):
                             _found = (_b2, _a2); break
-                    if _found is None or not ml:
+                    if _data_status == "comparison_unavailable":
+                        pass
+                    elif _found is None or not ml:
                         _data_status = "missing"
                     else:
                         _b2, _a2 = _found
@@ -405,8 +583,11 @@ def analyze(gid, slug, hm, state):
                         _data_status = "missing"
                     if _kind in ("leak", "leak_plus") and _data_status == "ok" and _vs.get("line") is not None:
                         _cmp = totals.get(float(_vs["line"]))
+                        _cmp_status = totals_status.get(float(_vs["line"]))
                         if _cmp is None:
                             _data_status = "missing"
+                        elif _cmp_status in ("closed", "paused", "inactive"):
+                            _data_status = "comparison_unavailable"
                         else:
                             _cmp_ask = (1 - _cmp[0]) if _pick == "Under" else _cmp[1]
                             if not (_price < _cmp_ask - 0.005):
@@ -422,7 +603,7 @@ def analyze(gid, slug, hm, state):
                          "kind": _kind, "raw_prob": _prob, "raw_price": _price,
                          "tracked_threshold": float(_thresh), "base_condition_false": _base_false,
                          "inversion_broken": _inversion_broken,
-                         "data_status": _data_status if _data_status == "missing" else None},
+                         "data_status": _data_status if _data_status in ("missing", "comparison_unavailable") else None},
                         {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
                          "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
                          "home_abbr": hab, "away_abbr": aab},
@@ -563,18 +744,8 @@ def analyze(gid, slug, hm, state):
     # book this round is a REVIEW (data_status=missing), not a loss.
     if _NEW_MODULES:
         try:
-            _tracked_raw = []
-            _tracked_path = os.environ.get("FC_TRACKED_FILE")
-            if _tracked_path and os.path.exists(_tracked_path):
-                with open(_tracked_path) as _tf:
-                    _tracked_raw = json.load(_tf)
-            elif os.environ.get("FC_TRACKED_JSON"):
-                _tracked_raw = json.loads(os.environ.get("FC_TRACKED_JSON") or "[]")
-            if isinstance(_tracked_raw, dict):
-                _tracked_raw = _tracked_raw.get("tracked_signals") or _tracked_raw.get("signals") or []
-            for _sig in _tracked_raw or []:
-                if isinstance(_sig, dict) and (not _sig.get("event_id") or str(_sig.get("event_id")) == str(gid)):
-                    tracked_evaluations.append(_eval_tracked(_sig))
+            for _sig in _load_tracked_raw():
+                tracked_evaluations.append(_eval_tracked(_sig))
         except Exception:
             pass
     # Shown flag: a candidate is shown iff its text is in the displayed
@@ -595,6 +766,7 @@ def analyze(gid, slug, hm, state):
                          "totals_ok": totals_ok, "hit_ok": hit_ok},
                 "candidates_all": cands, "process": process, "decisions": decisions,
                 "tracked_evaluations": tracked_evaluations,
+                "blocked_markets": blocked_markets,
                 "policy_version": POLICY_VERSION if _NEW_MODULES else "legacy",
                 "model_version": MODEL_VERSION if _NEW_MODULES else "legacy",
                 "scan_id": os.environ.get("FC_SCAN_ID"),
@@ -640,8 +812,16 @@ def main():
     for e in sb['events']:
         c = e['competitions'][0]; st = c['status']
         comp = {x['homeAway']: x for x in c['competitors']}
+        # Preserve the raw clock: a missing/null/empty displayClock
+        # must reach analyze() as None so it becomes DATA_ERROR, never
+        # a fabricated '0:00' (which would look like period end).
+        _raw_clk = st.get('displayClock')
+        if _raw_clk is None or (isinstance(_raw_clk, str) and _raw_clk.strip() == ""):
+            _raw_clk = None
+        elif not isinstance(_raw_clk, str):
+            _raw_clk = str(_raw_clk)
         states[e['id']] = (int(comp['home'].get('score') or 0), int(comp['away'].get('score') or 0),
-                           st.get('period'), st.get('displayClock') or '0:00',
+                           st.get('period'), _raw_clk,
                            comp['home']['team']['abbreviation'], comp['away']['team']['abbreviation'],
                            st['type']['description'])
     with ThreadPoolExecutor(max_workers=len(specs)) as ex:
