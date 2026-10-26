@@ -563,6 +563,7 @@ def main():
             # sent_at (cooldown) and tracked (still registered, not
             # invalidated) intact.
             log_msg(a.log, f"FAST_CHECK ERROR {type(e).__name__} pending cleared")
+            prev = set(prev) - set(pending)
             pending = set()
             save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
             if a.once:
@@ -597,6 +598,7 @@ def main():
                         _ent["last_reason_codes"] = ["clock_unknown"]
                         _held += 1
             log_msg(a.log, f"STATUS data_error clock_unknown tracked_held={_held} pending cleared")
+            prev = set(prev) - set(pending)
             pending = set()
             save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
             if a.once:
@@ -605,6 +607,7 @@ def main():
             continue
         if status != "live":
             log_msg(a.log, f"STATUS {status} waiting pending cleared")
+            prev = set(prev) - set(pending)
             pending = set()
             save_state(a.state, prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked)
             if a.once:
