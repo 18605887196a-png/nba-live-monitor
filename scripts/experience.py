@@ -17,7 +17,7 @@ CLI:
   python3 experience.py stats    # calibration: model prob vs actual hit rate,
                                  # by kind / market / prob bucket; user bet P&L
 """
-import json, os, sys, urllib.request
+import contextlib, fcntl, json, os, sys, urllib.request
 from datetime import datetime, timedelta, timezone
 
 CST = timezone(timedelta(hours=8))
@@ -25,6 +25,38 @@ BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experienc
 PUSHES = os.path.join(BASE, "pushes.jsonl")
 BETS = os.path.join(BASE, "bets.jsonl")
 RISKS = os.path.join(BASE, "risk_updates.jsonl")
+
+
+@contextlib.contextmanager
+def _file_lock(path):
+    """Cross-process exclusive lock for one JSONL file (C).
+
+    Every writer of the same file (read-modify-write AND append) must
+    hold this lock for its whole operation: an append that lands
+    between another writer's read and rewrite would otherwise be
+    silently lost, and both writers would still report success.
+    flock is released automatically if the holder dies, so a stale
+    lock cannot block later writers.
+    """
+    lock_path = path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _write_all(path, records):
+    """Write a whole JSONL file atomically (temp file + os.replace).
+    Callers must hold _file_lock(path); no reader ever sees a
+    half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
 
 
 def now_cst():
@@ -46,10 +78,16 @@ def load(path):
     return out
 
 
-def _append(path, rec):
-    os.makedirs(BASE, exist_ok=True)
+def _append_unlocked(path, rec):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        f.flush()
+
+
+def _append(path, rec):
+    with _file_lock(path):
+        _append_unlocked(path, rec)
 
 
 def _key(r):
@@ -74,9 +112,10 @@ def log_push(rec):
     rec = dict(rec)
     rec.setdefault("ts", now_cst())
     rec.setdefault("result", None)
-    if _key(rec) in {_key(r) for r in load(PUSHES)}:
-        return False
-    _append(PUSHES, rec)
+    with _file_lock(PUSHES):
+        if _key(rec) in {_key(r) for r in load(PUSHES)}:
+            return False
+        _append_unlocked(PUSHES, rec)
     return True
 
 
@@ -94,9 +133,10 @@ def log_detected(rec):
     # delivered is only set True by mark_sent(); never here.
     rec.setdefault("delivered", False)
     rec.setdefault("sent_at", None)
-    if _key_detected(rec) in {_key_detected(r) for r in load(PUSHES)}:
-        return False
-    _append(PUSHES, rec)
+    with _file_lock(PUSHES):
+        if _key_detected(rec) in {_key_detected(r) for r in load(PUSHES)}:
+            return False
+        _append_unlocked(PUSHES, rec)
     return True
 
 
@@ -108,25 +148,24 @@ def mark_sent(key, sent_at=None, sent_price_c=None, sent_prob=None):
     calls this. Does not overwrite detected price/probability;
     send-time values go in sent_* fields. Returns True when updated.
     """
-    pushes = load(PUSHES)
-    changed = False
-    kt = tuple(key)
-    for r in pushes:
-        match = _key_detected(r) == kt if len(kt) == 6 else _key(r) == kt
-        if match:
-            r["lifecycle"] = "sent"
-            r["delivered"] = True
-            r["sent_at"] = sent_at or now_cst()
-            if sent_price_c is not None:
-                r["sent_price_c"] = sent_price_c
-            if sent_prob is not None:
-                r["sent_prob"] = sent_prob
-            changed = True
-            break
-    if changed:
-        with open(PUSHES, "w") as f:
-            for r in pushes:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with _file_lock(PUSHES):
+        pushes = load(PUSHES)
+        changed = False
+        kt = tuple(key)
+        for r in pushes:
+            match = _key_detected(r) == kt if len(kt) == 6 else _key(r) == kt
+            if match:
+                r["lifecycle"] = "sent"
+                r["delivered"] = True
+                r["sent_at"] = sent_at or now_cst()
+                if sent_price_c is not None:
+                    r["sent_price_c"] = sent_price_c
+                if sent_prob is not None:
+                    r["sent_prob"] = sent_prob
+                changed = True
+                break
+        if changed:
+            _write_all(PUSHES, pushes)
     return changed
 
 
@@ -212,26 +251,30 @@ def _judge(rec, fin):
 
 
 def settle():
-    pushes = load(PUSHES)
-    finals, changed = {}, 0
-    for r in pushes:
-        if r.get("result") or not r.get("event_id"):
-            continue
-        eid = str(r["event_id"])
-        if eid not in finals:
-            finals[eid] = _final_for_event(eid)
-        fin = finals[eid]
-        if not fin:
-            continue
-        res = _judge(r, fin)
-        if res:
-            r["result"] = res
-            r["final"] = f"{fin['_away']} {fin[fin['_away']]}:{fin[fin['_home']]} {fin['_home']}"
-            changed += 1
-    if changed:
-        with open(PUSHES, "w") as f:
-            for r in pushes:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # Phase 1 (no lock): collect unsettled events and fetch finals.
+    # Holding the file lock across network calls would stall every
+    # other game's sender for the whole fetch.
+    event_ids = {str(r["event_id"]) for r in load(PUSHES)
+                 if not r.get("result") and r.get("event_id")}
+    finals = {eid: _final_for_event(eid) for eid in event_ids}
+    # Phase 2 (one lock): re-load (so concurrent mark_sent /
+    # log_detected during the fetch are preserved) and apply.
+    with _file_lock(PUSHES):
+        pushes = load(PUSHES)
+        changed = 0
+        for r in pushes:
+            if r.get("result") or not r.get("event_id"):
+                continue
+            fin = finals.get(str(r["event_id"]))
+            if not fin:
+                continue
+            res = _judge(r, fin)
+            if res:
+                r["result"] = res
+                r["final"] = f"{fin['_away']} {fin[fin['_away']]}:{fin[fin['_home']]} {fin['_home']}"
+                changed += 1
+        if changed:
+            _write_all(PUSHES, pushes)
     open_ct = sum(1 for r in pushes if not r.get("result"))
     print(f"settle: {changed} settled, {open_ct} still open")
     return changed
