@@ -16,6 +16,15 @@ Model (per team): WP = Phi((lead + M * t/48) / (13 * sqrt(t/48)))
 """
 import argparse, json, math, sys, time, urllib.request
 
+# v1 (2026-10-25): share clock/WP with fast_check via game_context.
+# Fallback to local implementations if the module is missing, so the
+# monitor never breaks on import alone.
+try:
+    from game_context import parse_clock_seconds as _parse_clock_seconds, game_time as _game_time, wp_home as _wp_home
+    _GAME_CTX = True
+except Exception:
+    _GAME_CTX = False
+
 def espn_event(event_id):
     # scoreboard first; falls back to summary endpoint when scoreboard
     # throws its usual post-tipoff IncompleteRead streak.
@@ -59,7 +68,10 @@ def phi(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 def parse_clock(clock):
-    # "5:22" or "0.0" style displayClock
+    # "5:22" or "0.0" style displayClock -> minutes remaining in period.
+    # Delegates to game_context when available (single clock parser).
+    if _GAME_CTX:
+        return _parse_clock_seconds(clock) / 60.0
     try:
         if ":" in clock:
             m, s = clock.split(":")
@@ -151,14 +163,21 @@ def main():
                              "quarters": [l.get("value") for l in c.get("linescores", [])]}
                 order.append(ha)
             home, away = teams.get("home", {}), teams.get("away", {})
-            # minutes remaining in regulation
-            clk = parse_clock(str(clock))
-            if period >= 5:
-                t = clk
-            elif period >= 1:
-                t = clk + 12.0 * (4 - period)
+            # minutes remaining / elapsed, via the shared game_time():
+            # OT elapsed is 48 + (OT-1)*5 + OT elapsed, never 48 - OT rem.
+            if _GAME_CTX:
+                elapsed_total, t, _is_ot = _game_time(period, str(clock))
             else:
-                t = 48.0
+                clk = parse_clock(str(clock))
+                if period >= 5:
+                    t = clk
+                    elapsed_total = 48.0 + (period - 5) * 5.0 + (5.0 - clk)
+                elif period >= 1:
+                    t = clk + 12.0 * (4 - period)
+                    elapsed_total = 48.0 - t
+                else:
+                    t = 48.0
+                    elapsed_total = 0.0
 
             gm = fetch(f"https://gamma-api.polymarket.com/events?slug={args.slug}")
             gev = gm[0] if isinstance(gm, list) and gm else {}
@@ -172,9 +191,11 @@ def main():
                 bid = bid0 if i == 0 else (None if ask0 is None else 1 - ask0)
                 ask = ask0 if i == 0 else (None if bid0 is None else 1 - bid0)
                 return bid, ask
-            # win prob per home/away
+            # win prob per home/away, shared model (game_context.wp_home).
             lead_home = home.get("score", 0) - away.get("score", 0)
-            if t >= 0.5:
+            if _GAME_CTX:
+                wp_home = _wp_home(lead_home, args.home_margin, t)
+            elif t >= 0.5:
                 denom = 13.0 * math.sqrt(t / 48.0)
                 wp_home = phi((lead_home + args.home_margin * (t / 48.0)) / denom)
             else:
@@ -224,45 +245,34 @@ def main():
             row["spread_mkt"] = (markets.get(args.spread_question, {}) or {}).get("outcomePrices") if args.spread_question else None
             row["total_mkt"] = (markets.get(args.total_question, {}) or {}).get("outcomePrices") if args.total_question else None
             row["total_pts"] = home.get("score", 0) + away.get("score", 0)
-            elapsed = 48.0 - t if period <= 4 else 48.0
-            row["pace_proj_total"] = round(row["total_pts"] + (row["total_pts"] / elapsed) * t, 1) if elapsed > 0 and period <= 4 else None
+            # OT pace: total elapsed (incl. OT) * remaining OT time.
+            # Previously OT pace was None (period<=4 guard) and elapsed
+            # was stuck at 48; both are fixed by elapsed_total above.
+            row["pace_proj_total"] = round(row["total_pts"] + (row["total_pts"] / elapsed_total) * t, 1) if elapsed_total > 0 else None
             emit("POLL", row)
 
             if trig:
                 emit("TRIGGER", {"trigger": trig, "period": period, "clock": clock,
                                  "score": f"{away.get('name')} {away.get('score')} : {home.get('score')} {home.get('name')}"})
-                # Experience bank: one record per (event, side) trigger, first wins.
-                # Self-contained on purpose (monitor.py runs detached via setsid);
-                # logging must never break the monitor loop.
+                # Experience bank v1: TRIGGER is data-log only, so it is
+                # logged as DETECTED, never delivered=True. Sender marks
+                # SENT only after a real TG send. First wins, as before.
                 try:
-                    import datetime as _dt, os as _os
+                    import datetime as _dt
+                    import experience as _exp
                     _cst = _dt.timezone(_dt.timedelta(hours=8))
                     _now = _dt.datetime.now(_cst)
                     _dus = (_now - _dt.timedelta(days=1)).strftime("%Y%m%d") if _now.hour < 15 else _now.strftime("%Y%m%d")
-                    _p = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "experience", "pushes.jsonl")
-                    _os.makedirs(_os.path.dirname(_p), exist_ok=True)
-                    _rec = {"ts": _now.strftime("%Y-%m-%d %H:%M:%S"), "date_us": _dus,
-                            "event_id": str(args.event_id),
-                            "game": f"{away.get('name')} @ {home.get('name')}",
-                            "market": "ml", "pick": trig["side"], "line": None,
-                            "price_c": round(trig["ask"] * 100, 1), "prob": trig["wp"],
-                            "kind": "trigger", "delivered": True,
-                            "score": f"{away.get('score')}:{home.get('score')}",
-                            "clock": f"Q{period} {clock}", "result": None}
-                    _dup = False
-                    if _os.path.exists(_p):
-                        with open(_p) as _f:
-                            for _l in _f:
-                                try:
-                                    _r = json.loads(_l)
-                                except Exception:
-                                    continue
-                                if (_r.get("event_id"), _r.get("market"), _r.get("pick")) == (_rec["event_id"], "ml", _rec["pick"]):
-                                    _dup = True
-                                    break
-                    if not _dup:
-                        with open(_p, "a") as _f:
-                            _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+                    _exp.log_detected({
+                        "ts": _now.strftime("%Y-%m-%d %H:%M:%S"), "date_us": _dus,
+                        "event_id": str(args.event_id),
+                        "game": f"{away.get('name')} @ {home.get('name')}",
+                        "market": "ml", "pick": trig["side"], "line": None,
+                        "price_c": round(trig["ask"] * 100, 1), "raw_price": trig["ask"],
+                        "prob": trig["wp"], "raw_prob": trig["wp"],
+                        "kind": "trigger",
+                        "score": f"{away.get('score')}:{home.get('score')}",
+                        "clock": f"Q{period} {clock}", "result": None})
                 except Exception:
                     pass
                 # trigger is data-log only; only mode=trigger exits on it (2026-10-24 fix:

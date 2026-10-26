@@ -24,6 +24,7 @@ CST = timezone(timedelta(hours=8))
 BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experience")
 PUSHES = os.path.join(BASE, "pushes.jsonl")
 BETS = os.path.join(BASE, "bets.jsonl")
+RISKS = os.path.join(BASE, "risk_updates.jsonl")
 
 
 def now_cst():
@@ -55,13 +56,86 @@ def _key(r):
     return (r.get("date_us"), r.get("event_id"), r.get("market"), r.get("pick"), r.get("line"))
 
 
+def _key_detected(r):
+    """v1 detected dedup: kind is part of the key, so a hit and a leak
+    for the same line are two distinct candidates and both are kept.
+    Legacy log_push keeps the old key (without kind) for backfills."""
+    return (r.get("date_us"), r.get("event_id"), r.get("market"), r.get("pick"), r.get("line"), r.get("kind"))
+
+
 def log_push(rec):
+    """Legacy writer, kept for backfills only.
+
+    Live code must use log_detected() + mark_sent() instead: detected
+    is never automatically delivered=True (2026-10-25 architecture,
+    section 7). log_push preserves its old behaviour for historical
+    callers that pass delivered explicitly.
+    """
     rec = dict(rec)
     rec.setdefault("ts", now_cst())
     rec.setdefault("result", None)
     if _key(rec) in {_key(r) for r in load(PUSHES)}:
         return False
     _append(PUSHES, rec)
+    return True
+
+
+def log_detected(rec):
+    """Record a candidate at detection time, full precision, unshown
+    candidates included. lifecycle=detected, delivered=False, sent_at
+    is None until mark_sent() is called after a real TG send. First
+    sighting of a (date, event, market, pick, line) wins; later polls
+    never overwrite its detected price/probability."""
+    rec = dict(rec)
+    rec.setdefault("ts", now_cst())
+    rec.setdefault("detected_at", rec["ts"])
+    rec.setdefault("result", None)
+    rec["lifecycle"] = "detected"
+    # delivered is only set True by mark_sent(); never here.
+    rec.setdefault("delivered", False)
+    rec.setdefault("sent_at", None)
+    if _key_detected(rec) in {_key_detected(r) for r in load(PUSHES)}:
+        return False
+    _append(PUSHES, rec)
+    return True
+
+
+def mark_sent(key, sent_at=None, sent_price_c=None, sent_prob=None):
+    """Mark a detected record as actually sent, after a TG send ok.
+
+    key: (date_us, event_id, market, pick, line) or with kind appended.
+    Only called inside a sender's `if ok:` block; a failed send never
+    calls this. Does not overwrite detected price/probability;
+    send-time values go in sent_* fields. Returns True when updated.
+    """
+    pushes = load(PUSHES)
+    changed = False
+    kt = tuple(key)
+    for r in pushes:
+        match = _key_detected(r) == kt if len(kt) == 6 else _key(r) == kt
+        if match:
+            r["lifecycle"] = "sent"
+            r["delivered"] = True
+            r["sent_at"] = sent_at or now_cst()
+            if sent_price_c is not None:
+                r["sent_price_c"] = sent_price_c
+            if sent_prob is not None:
+                r["sent_prob"] = sent_prob
+            changed = True
+            break
+    if changed:
+        with open(PUSHES, "w") as f:
+            for r in pushes:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    return changed
+
+
+def log_risk(rec):
+    """Append a risk update (REVIEW/INVALIDATED) to risk_updates.jsonl.
+    Risk updates are not pushes and never enter pushes.jsonl calibration."""
+    rec = dict(rec)
+    rec.setdefault("ts", now_cst())
+    _append(RISKS, rec)
     return True
 
 
@@ -173,9 +247,14 @@ def _wl(rows):
 
 def stats():
     pushes, bets = load(PUSHES), load(BETS)
-    formal = [r for r in pushes if r.get("delivered") and r.get("kind") in ("hit", "leak", "leak_plus", "trigger")]
+    # v1 (2026-10-25): formal = actually sent only. Legacy delivered
+    # (pre-v1 fast_check/monitor logs) mixed detected with sent, so it
+    # is shown separately and must not be quoted as sent calibration.
+    formal = [r for r in pushes if r.get("lifecycle") == "sent" and r.get("kind") in ("hit", "leak", "leak_plus", "trigger")]
+    legacy = [r for r in pushes if r.get("delivered") and r.get("kind") in ("hit", "leak", "leak_plus", "trigger")]
+    detected = [r for r in pushes if r.get("lifecycle") == "detected"]
     print("=== pushes (experience bank) ===")
-    print(f"total records: {len(pushes)}")
+    print(f"total records: {len(pushes)}  detected-not-sent: {len(detected)}  sent (v1): {len(formal)}  legacy delivered (pre-v1, detected+sent mixed): {len(legacy)}")
     w, l = _wl(formal)
     if w + l:
         print(f"formal pushes delivered: {w}W-{l}L  hit {w/(w+l)*100:.1f}%  (n={w+l})")

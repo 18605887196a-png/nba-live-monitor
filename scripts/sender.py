@@ -23,6 +23,11 @@ Rules (match the user's push format):
   ALWAYS sends a node message, even if no line qualifies (then a one-line
   '暂无够格线' status), so every game gets its node broadcasts. Node flags
   persist in the state file; a failed node send retries next cycle.
+- Priority (user 2026-10-26): main pushes > nodes > risk updates.
+  Risk updates are lowest priority and gated by decision.risk_send_allowed:
+  INVALIDATED always, REVIEW only in Q4 late (remaining <= 5 min) or when
+  raw_prob fell below its push threshold; early-game REVIEW (e.g. Q3) is
+  logged only (RISK held), never tg-sent, never SENT_RISK_MSG.
 
 Usage:
   sender.py <US date YYYYMMDD> <event_id:slug:home_margin>
@@ -53,6 +58,14 @@ NAME_CN = {
 TG_PY = os.path.expanduser("~/workspace/custom-connectors/custom.telegram/bin/tg.py")
 FC_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_check.py")
 FC_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# v1 context: decision helpers are optional; sender works without them
+# (text parsing remains the push path in bypass stage).
+try:
+    from decision import should_send_risk, format_context_block, risk_send_allowed
+    _DECISION_OK = True
+except Exception:
+    _DECISION_OK = False
 
 def cn(team):
     return TEAM_CN.get(team) or NAME_CN.get(team) or team
@@ -265,20 +278,69 @@ def load_state(path):
                 bool(d.get("q3_node", False)), bool(d.get("q4_node", False)),
                 int(d.get("prev_per", 0)),
                 set(tuple(x) for x in d.get("pending", [])),
-                dict(d.get("sent_at", {})))
+                dict(d.get("sent_at", {})),
+                dict(d.get("risk_alerts", {})))
     except Exception:
-        return set(), False, False, 0, set(), {}
+        return set(), False, False, 0, set(), {}, {}
+
 
 def save_state(path, qualified, q3_node=False, q4_node=False, prev_per=0,
-               pending=None, sent_at=None):
+               pending=None, sent_at=None, risk_alerts=None):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"qualified": [list(x) for x in qualified],
                    "q3_node": q3_node, "q4_node": q4_node,
                    "prev_per": prev_per,
                    "pending": [list(x) for x in (pending or set())],
-                   "sent_at": sent_at or {}}, f)
+                   "sent_at": sent_at or {},
+                   "risk_alerts": risk_alerts or {}}, f)
     os.replace(tmp, path)
+
+
+def context_suffix(structured, top_key):
+    """Context block for a message, without duplicating the state line.
+
+    structured: fast_check structured JSON (or None). top_key: sender
+    key (kind, market, pick, line) for the conclusion candidate.
+    Returns "" when no structured decision is available.
+    """
+    if not structured or not _DECISION_OK:
+        return ""
+    try:
+        game = structured.get("game") or {}
+        process = structured.get("process")
+        cands = structured.get("candidates_all") or []
+        match = None
+        for c in cands:
+            if (c.get("kind"), c.get("market"), c.get("pick"), c.get("line")) == tuple(top_key):
+                match = c
+                break
+        if not match:
+            return ""
+        block = format_context_block(game, process, {"windows": match.get("market_windows")}, match.get("decision"))
+        lines = block.splitlines()
+        # Drop the duplicated game line (sender already prints state_line).
+        lines = [l for l in lines if not l.startswith("比赛：")]
+        return "\n".join(lines) if lines else ""
+    except Exception:
+        return ""
+
+
+def load_structured(path, max_age_sec=120, force=False):
+    """Load a fast_check structured file, or None when missing/stale.
+
+    force=True is for test mode (SENDER_STRUCTURED_FILE), where the
+    file is intentionally pre-made and age is irrelevant.
+    """
+    try:
+        if not path or not os.path.exists(path):
+            return None
+        if not force and time.time() - os.path.getmtime(path) > max_age_sec:
+            return None
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 def log_msg(logf, msg):
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -295,15 +357,39 @@ def tg_send(text, chat_id):
     except Exception:
         return False
 
-def run_fast_check(date, spec, test_input):
+def run_fast_check(date, spec, test_input, structured_path=None, target_usd=None):
     if test_input:
         with open(test_input) as f:
             return f.read()
     env = dict(os.environ)
     env["FC_EARLY_LOG_ONLY"] = "1"
+    if structured_path:
+        env["FC_STRUCTURED_OUT"] = structured_path
+    if target_usd is not None:
+        env["FC_TARGET_USD"] = str(target_usd)
     r = subprocess.run([sys.executable, FC_PY, date, spec],
                        capture_output=True, text=True, timeout=40, cwd=FC_DIR, env=env)
     return r.stdout
+
+
+def _mark_sent(date_us, event_id, items):
+    """Mark sent candidates in experience, only after a TG ok.
+
+    items: sender (key, info) list for MAIN candidates only (spreads
+    attach-only are not formal pushes). Never called on failure or
+    dry-run. Failures here must not break the send loop.
+    """
+    try:
+        sys.path.insert(0, FC_DIR)
+        import experience as _exp
+        for k, info in items:
+            kind, market, pick, line = k
+            prob = info.get("prob")
+            sent_prob = prob / 100.0 if prob is not None and prob > 1 else prob
+            _exp.mark_sent((date_us, str(event_id), market, pick, line, kind),
+                           sent_price_c=info.get("price"), sent_prob=sent_prob)
+    except Exception:
+        pass
 
 def main():
     ap = argparse.ArgumentParser()
@@ -317,15 +403,20 @@ def main():
     ap.add_argument("--test-input")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--max-hours", type=float, default=4.5)
+    ap.add_argument("--target-usd", type=float, default=None,
+                    help="target USD for cost calculation; unset means cost unknown, never zero")
     a = ap.parse_args()
-    prev, q3_node, q4_node, prev_per, pending, sent_at = load_state(a.state)
+    prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts = load_state(a.state)
+    _event_id = a.spec.split(":")[0] if ":" in a.spec else a.spec
+    _structured_path = a.state + ".structured.json"
     t0 = time.time()
     while True:
         if time.time() - t0 > a.max_hours * 3600:
             log_msg(a.log, "MAX_HOURS exit")
             return 0
         try:
-            out = run_fast_check(a.date, a.spec, a.test_input)
+            out = run_fast_check(a.date, a.spec, a.test_input,
+                                 structured_path=_structured_path, target_usd=a.target_usd)
         except Exception as e:
             log_msg(a.log, f"FAST_CHECK ERROR {type(e).__name__}")
             if a.once:
@@ -333,6 +424,12 @@ def main():
             time.sleep(a.interval)
             continue
         status, state, items = parse_output(out)
+        # Structured context for this cycle, if fresh (or test-forced).
+        _test_struct = os.environ.get("SENDER_STRUCTURED_FILE")
+        if a.test_input and _test_struct:
+            structured = load_structured(_test_struct, force=True)
+        else:
+            structured = load_structured(_structured_path)
         if status == "final":
             log_msg(a.log, "STATUS final exit")
             return 0
@@ -382,8 +479,21 @@ def main():
             spread_all = [(k, i) for k, i in items if k[1] == "spread"]
             if main_all:
                 node_msg = compose(state, main_all, spread_all, prefix=label)
+                _ctx = context_suffix(structured, main_all[0][0])
+                if _ctx:
+                    node_msg = node_msg + "\n\n" + _ctx
             else:
                 node_msg = f"{label}{state_line(state)}，暂无够格线"
+                # Node with no qualified line still gets process context
+                # when structured data is available (no candidate, no cost).
+                if structured and _DECISION_OK:
+                    try:
+                        _blk = format_context_block(structured.get("game") or {}, structured.get("process"), None, None)
+                        _blk_lines = [l for l in _blk.splitlines() if not l.startswith("比赛：")]
+                        if _blk_lines:
+                            node_msg = node_msg + "\n" + "\n".join(_blk_lines)
+                    except Exception:
+                        pass
             if a.dry_run:
                 log_msg(a.log, f"DRY-RUN node {node_kind} would send:\n" + node_msg)
                 if node_kind == "q3":
@@ -394,12 +504,17 @@ def main():
                     q4_node = True
                 prev = cur
                 pending = set()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+                for k, _ in main_all + spread_all:
+                    sent_at[sig_key(k)] = time.time()
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
             else:
                 ok = tg_send(node_msg, a.chat)
                 log_msg(a.log, f"NODE {node_kind} {'ok' if ok else 'FAILED'} main={len(main_all)} spread={len(spread_all)}")
                 if ok:
                     log_msg(a.log, "SENT_NODE_MSG:\n" + node_msg)
+                    # v1: a node send counts as a send for cooldown and
+                    # for experience (main candidates only).
+                    _mark_sent(a.date, _event_id, main_all)
                 if ok:
                     if node_kind == "q3":
                         q3_node = True
@@ -409,7 +524,9 @@ def main():
                         q4_node = True
                     prev = cur
                     pending = set()
-                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+                    for k, _ in main_all + spread_all:
+                        sent_at[sig_key(k)] = time.time()
+                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
                 # on failure flags stay: next cycle retries
             if a.once:
                 return 0
@@ -429,7 +546,7 @@ def main():
                 log_msg(a.log, f"GATED early Q{per} newly={len(newly_main)} logged-only")
                 prev = cur
                 pending = set()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
                 if a.once:
                     return 0
                 time.sleep(a.interval)
@@ -442,35 +559,103 @@ def main():
         _pending_after = set(sig_of(k) for k, _ in _new_hits) if per >= 3 else set()
         if _send_main:
             msg = compose(state, _send_main, _send_spread)
+            _ctx = context_suffix(structured, _send_main[0][0])
+            if _ctx:
+                msg = msg + "\n\n" + _ctx
             if a.dry_run:
                 log_msg(a.log, "DRY-RUN would send:\n" + msg)
                 prev = cur
                 pending = _pending_after
                 for k, _ in _send_main + _send_spread:
                     sent_at[sig_key(k)] = time.time()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
             else:
                 ok = tg_send(msg, a.chat)
                 log_msg(a.log, f"SEND {'ok' if ok else 'FAILED'} newly={len(_send_main)} spread={len(_send_spread)}")
                 if ok:
                     log_msg(a.log, "SENT_MSG:\n" + msg)
+                    _mark_sent(a.date, _event_id, _send_main)
                 if ok:
                     prev = cur
                     pending = _pending_after
                     for k, _ in _send_main + _send_spread:
                         sent_at[sig_key(k)] = time.time()
-                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
                 # on failure prev/pending/sent_at stay: next cycle retries
         elif _new_hits:
             log_msg(a.log, f"PENDING {len(_new_hits)} awaiting confirmation")
             prev = cur
             pending = set(sig_of(k) for k, _ in _new_hits)
-            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
         else:
-            log_msg(a.log, f"STATUS live nothing-new qualified={len(cur)}")
+            # v1 risk escalation: a previously sent line whose structured
+            # decision is now REVIEW/INVALIDATED with NEW reasons is sent
+            # even inside the 15-minute cooldown, once per reason set.
+            # Candidates never sent before do not get a risk update here;
+            # their context is already in the main/node message when sent.
+            _risk_sent = False
+            if structured and _DECISION_OK:
+                for _c in structured.get("candidates_all") or []:
+                    _dec = _c.get("decision") or {}
+                    _state_r = _dec.get("state")
+                    _reasons = _dec.get("reason_codes") or []
+                    if _state_r not in ("REVIEW", "INVALIDATED") or not _reasons:
+                        continue
+                    _ckey = f"{_c['market']}|{_c['pick']}|{_c['line']}"
+                    if _ckey not in sent_at:
+                        continue
+                    _skey = (_dec.get("kind") or _c.get("kind"), _c["market"], _c["pick"], _c["line"])
+                    if not should_send_risk(_ckey, _state_r, _reasons, risk_alerts):
+                        continue
+                    # Priority gate (user 2026-10-26): risk is lowest priority.
+                    # Early-game REVIEW is logged only, never sent, and never
+                    # marked in risk_alerts, so it can still fire if the
+                    # gate later opens (Q4 late / INVALIDATED / prob drop).
+                    _game_ctx = structured.get("game") if isinstance(structured, dict) else None
+                    if not risk_send_allowed(_state_r, _dec.get("kind") or _c.get("kind"),
+                                             _c.get("raw_prob"), _game_ctx):
+                        log_msg(a.log, f"RISK held (priority gate) {_ckey} {_state_r} period={per} reasons={','.join(_reasons)}")
+                        try:
+                            sys.path.insert(0, FC_DIR)
+                            import experience as _exp_h
+                            _exp_h.log_risk({"date_us": a.date, "event_id": str(_event_id),
+                                             "market": _c["market"], "pick": _c["pick"], "line": _c["line"],
+                                             "kind": _c.get("kind"), "state": _state_r,
+                                             "reason_codes": _reasons, "gate": "held"})
+                        except Exception:
+                            pass
+                        continue
+                    _alert_key = f"{_ckey}|{_state_r}|{','.join(sorted(_reasons))}"
+                    _state_cn = "需复核" if _state_r == "REVIEW" else "原条件失效"
+                    _reason_txt = "；".join(_dec.get("reasons_text") or _reasons)
+                    _risk_msg = (f"{state_line(state)}\n\n风险更新：{fmt_main(_skey, {'price': _c.get('raw_price') * 100 if _c.get('raw_price') is not None else None, 'prob': (_c.get('raw_prob') * 100 if _c.get('raw_prob') is not None else None), 'text': _c.get('text', '')}, False, state['ot'])}\n"
+                                 f"状态：{_state_cn}｜原因：{_reason_txt}\n说明：先前条件已变化，仅作提醒，不是卖出指令")
+                    if a.dry_run:
+                        log_msg(a.log, "DRY-RUN risk would send:\n" + _risk_msg)
+                        risk_alerts[_alert_key] = time.time()
+                        _risk_sent = True
+                    else:
+                        _ok = tg_send(_risk_msg, a.chat)
+                        log_msg(a.log, f"RISK {'ok' if _ok else 'FAILED'} {_ckey} {_state_r}")
+                        if _ok:
+                            log_msg(a.log, "SENT_RISK_MSG:\n" + _risk_msg)
+                            risk_alerts[_alert_key] = time.time()
+                            try:
+                                sys.path.insert(0, FC_DIR)
+                                import experience as _exp
+                                _exp.log_risk({"date_us": a.date, "event_id": str(_event_id),
+                                               "market": _c["market"], "pick": _c["pick"], "line": _c["line"],
+                                               "kind": _c.get("kind"), "state": _state_r,
+                                               "reason_codes": _reasons})
+                            except Exception:
+                                pass
+                            _risk_sent = True
+                    break
+            if not _risk_sent:
+                log_msg(a.log, f"STATUS live nothing-new qualified={len(cur)}")
             prev = cur
             pending = set()
-            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at)
+            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
         if a.once:
             return 0
         time.sleep(a.interval)
