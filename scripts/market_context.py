@@ -31,11 +31,13 @@ try:
     from policy_config import (
         MARKET_ANOMALY_MOVE_CENTS_120S,
         MARKET_WINDOWS_SEC,
+        MARKET_WINDOW_MAX_GAP_SEC,
         SPREAD_WIDEN_CENTS,
     )
 except Exception:  # pragma: no cover
     MARKET_ANOMALY_MOVE_CENTS_120S = 10
     MARKET_WINDOWS_SEC = (30, 120)
+    MARKET_WINDOW_MAX_GAP_SEC = 180.0
     SPREAD_WIDEN_CENTS = 10
 
 
@@ -262,6 +264,19 @@ def market_window_features(history, current, score_changed=None):
             coverage = round((cur_t - base_t) / float(w), 3) if w else 0.0
         base_t = float(base.get("received_epoch", 0.0))
         delta = cur_t - base_t
+        # Gap check (E, same rule as the game-time window): a window
+        # is only "full" if it is actually sampled through. Base
+        # deviation from the window start, and every adjacent received
+        # gap inside the window (base -> ... -> current), must be
+        # within tolerance. A 600-second span with only endpoints is
+        # an observed 600-second change, never a 120-second change;
+        # no interpolation is done.
+        _span_ts = sorted([float(s.get("received_epoch", 0.0)) for s in earlier
+                           if base_t <= float(s.get("received_epoch", 0.0)) < cur_t] + [cur_t])
+        _gaps = [b - a for a, b in zip(_span_ts, _span_ts[1:])] if len(_span_ts) > 1 else [delta]
+        _max_gap = max(_gaps) if _gaps else delta
+        _base_dev = (target - base_t) if base_t < target else 0.0
+        _insufficient = (_max_gap > MARKET_WINDOW_MAX_GAP_SEC or _base_dev > MARKET_WINDOW_MAX_GAP_SEC)
         if score_changed is None:
             try:
                 sc = (
@@ -295,10 +310,14 @@ def market_window_features(history, current, score_changed=None):
                 last_only = True
         except Exception:
             pass
-        # Classification: only the 120s window with full coverage can
-        # trigger a review on size; shorter/partial windows are reported
-        # as observed changes, not anomalies, to avoid flicker reviews.
-        if last_only:
+        # Classification: only the 120s window with full, actually
+        # sampled coverage can trigger a review on size. A gapped
+        # window is reported as insufficient_coverage (with its real
+        # span and move kept for display), never as a short-window
+        # anomaly, to avoid flicker reviews.
+        if _insufficient:
+            cls = "insufficient_coverage"
+        elif last_only:
             cls = "insufficient_last_only"
         elif spread_ch is not None and spread_ch >= SPREAD_WIDEN_CENTS:
             cls = "review_spread_widening"
@@ -314,9 +333,17 @@ def market_window_features(history, current, score_changed=None):
             cls = "normal_repricing"
         else:
             cls = "no_anomaly"
+        if coverage >= 1.0 and _insufficient:
+            _cov_status = "insufficient_coverage"
+        elif coverage >= 1.0:
+            _cov_status = "full"
+        else:
+            _cov_status = "insufficient_coverage" if _insufficient else "partial"
         out[w] = {
             "status": "ok",
-            "coverage_status": "full" if coverage >= 1.0 else "partial",
+            "coverage_status": _cov_status,
+            "history_gap": bool(_insufficient),
+            "max_gap_sec": round(_max_gap, 1),
             "actual_delta_sec": round(delta, 1),
             "coverage": coverage,
             "bid_change_c": bid_ch,

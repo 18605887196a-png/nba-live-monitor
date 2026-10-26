@@ -182,12 +182,18 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
         _mw = market.get("windows") or {}
         w120 = _mw.get(120, _mw.get("120", {}))
         cls = w120.get("classification") if isinstance(w120, dict) else None
-        if cls == "review_price_move_no_score":
-            reasons.append("market_move_no_score")
-        elif cls == "review_spread_widening":
-            reasons.append("spread_widening")
-        elif cls == "insufficient_last_only":
-            reasons.append("last_only_move")
+        # (E) A short-window anomaly only counts on a full-coverage
+        # window; a gapped window's classification is already
+        # insufficient_coverage, and this guard keeps it from ever
+        # being read as a 120s move.
+        _mcov = w120.get("coverage_status") if isinstance(w120, dict) else None
+        if _mcov is None or _mcov == "full":
+            if cls == "review_price_move_no_score":
+                reasons.append("market_move_no_score")
+            elif cls == "review_spread_widening":
+                reasons.append("spread_widening")
+            elif cls == "insufficient_last_only":
+                reasons.append("last_only_move")
     # Process risk, direction-aware where possible.
     tags = []
     if process and isinstance(process, dict):

@@ -54,6 +54,7 @@ GAME_WINDOWS_MIN = (2, 5)
 # without a snapshot (data gap, not a pause: pauses do not advance
 # game elapsed), so the window is NOT a full 2/5-minute observation.
 WINDOW_MAX_GAP_MIN = 3.0
+MARKET_WINDOW_MAX_GAP_SEC = 180.0
 # A window is "covered" when we have a snapshot at or before its start.
 # With no history at all the window is unknown, never zero.
 WINDOW_MIN_COVERAGE = 1.0  # snapshot must reach the window start for full coverage
