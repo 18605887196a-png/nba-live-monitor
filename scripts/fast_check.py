@@ -130,6 +130,24 @@ def analyze(gid, slug, hm, state):
     pace = (tot + 4.71 * 12) / (elapsed + 12) if elapsed > 0 else 4.71
     mu = tot + pace * t
     sd_t = min(2.0 * math.sqrt(pace * t), 21) if t > 0 else 1.0
+    # OT probability (same normal model as below) + OT-scenario total.
+    # Totals projections are regulation-only, so a close Q4 Under push
+    # needs an explicit OT warning (user 2026-10-26, push + warning, no block).
+    ot = 0.0
+    if sd_m:
+        _mean_m_home = lead + hm * t / 48
+        ot = Phi((0.5 - _mean_m_home) / sd_m) - Phi((-0.5 - _mean_m_home) / sd_m)
+    ot_scenario = mu + pace * 5.0 if per >= 4 else None
+
+    def _ot_warning(line, pick):
+        if pick != "Under" or ot_scenario is None or abs(lead) > 8:
+            return None
+        _cush_ot = line - ot_scenario
+        if ot < 0.03 and _cush_ot >= 20:
+            return None
+        if _cush_ot < 0:
+            return f"加时风险：若进加时按当前节奏约 {ot_scenario:.0f} 分，已超过 {line:g} 线"
+        return f"加时风险：若进加时按当前节奏约 {ot_scenario:.0f} 分，离 {line:g} 只剩 {_cush_ot:.0f} 分"
 
     ev = get(f"https://gamma-api.polymarket.com/events?slug={slug}")[0]
     title = ev['title']
@@ -161,13 +179,13 @@ def analyze(gid, slug, hm, state):
     # below, at full precision. Text output and thresholds are unchanged.
     cands = []
 
-    def _add_cand(market, pick, line, kind, prob, buy_price, bid, ask, text, identity):
+    def _add_cand(market, pick, line, kind, prob, buy_price, bid, ask, text, identity, ot_warning=None):
         cands.append({"market": market, "pick": pick, "line": line, "kind": kind,
                       "raw_prob": float(prob) if prob is not None else None,
                       "raw_price": float(buy_price) if buy_price is not None else None,
                       "bid": float(bid) if bid is not None else None,
                       "ask": float(ask) if ask is not None else None,
-                      "text": text, "identity": identity})
+                      "text": text, "identity": identity, "ot_warning": ot_warning})
     if ml and sd_m:
         if hit_ok and 1 - wp_home >= 0.95:
             hits.append((1 - wp_home, f"ML {aab} ask {fmt_price(ml[1])} prob {(1-wp_home)*100:.0f}%"))
@@ -204,7 +222,7 @@ def analyze(gid, slug, hm, state):
             _add_cand("total", "Over", ln, "hit", p_over, a, b, a, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})", totals_id.get(ln))
         if hit_ok and totals_ok and 1 - p_over >= 0.95 and ln - mu >= 10:
             hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
-            _add_cand("total", "Under", ln, "hit", 1 - p_over, 1 - b, b, 1 - b, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})", totals_id.get(ln))
+            _add_cand("total", "Under", ln, "hit", 1 - p_over, 1 - b, b, 1 - b, f"Total Under {ln} ask {fmt_price(1-b)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})", totals_id.get(ln), ot_warning=_ot_warning(ln, "Under"))
     ls = sorted(totals)
     for i in range(len(ls) - 1):
         l1, l2 = ls[i], ls[i + 1]
@@ -214,7 +232,7 @@ def analyze(gid, slug, hm, state):
             p = 1 - Phi((mu - l2) / sd_t)
             if totals_ok and p >= 0.90:
                 leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})")
-                _add_cand("total", "Under", l2, "leak", p, ua2, totals[l2][0], ua2, f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})", totals_id.get(l2))
+                _add_cand("total", "Under", l2, "leak", p, ua2, totals[l2][0], ua2, f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})", totals_id.get(l2), ot_warning=_ot_warning(l2, "Under"))
         if oa2 > oa1 + 0.005:
             p = Phi((mu - l1) / sd_t)
             if totals_ok and p >= 0.90:
@@ -336,7 +354,7 @@ def analyze(gid, slug, hm, state):
                 "game": {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
                          "home_abbr": hab, "away_abbr": aab, "lead": lead, "tot": tot,
                          "elapsed_min": elapsed, "remaining_min": t, "is_ot": is_ot,
-                         "wp_home": wp_home, "proj_total": mu, "ot_prob": ot,
+                         "wp_home": wp_home, "proj_total": mu, "ot_prob": ot, "ot_scenario_total": ot_scenario,
                          "totals_ok": totals_ok, "hit_ok": hit_ok},
                 "candidates_all": cands, "process": process, "decisions": decisions,
                 "policy_version": POLICY_VERSION if _NEW_MODULES else "legacy",

@@ -13,8 +13,22 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261026-risk-priority"
+POLICY_VERSION = "v1-20261026-ot-warning"
 MODEL_VERSION = "fast_check-20261025-wp-pace"
+
+# Overtime warning for totals (user 2026-10-26, inferred by assistant):
+# Totals projections are REGULATION-only; the printed OT % alone does
+# not adjust them. A totals push still goes out (push + warning, never
+# blocked by this), but an Under push gets an explicit warning when the
+# game is close in Q4/OT and one OT at the current pace would eat most
+# of its cushion. Over pushes need no warning: OT only helps Over.
+#  - close: abs(lead) <= 8 in period >= 4 (OT included)
+#  - OT scenario total = regulation proj + current pace * 5 minutes
+#  - warn when OT prob >= 3% OR OT-scenario cushion < 20 points
+#    (Under line - OT-scenario total < 20; negative = OT alone busts it)
+OT_WARN_CLOSE_LEAD = 8
+OT_WARN_OT_PROB = 0.03
+OT_WARN_OT_CUSHION = 20
 
 # Risk-update priority (user 2026-10-26): risk is the LOWEST priority,
 # below main pushes (hit/leak) and fixed nodes (Q3-end, Q4 6:00).

@@ -38,6 +38,7 @@ launch 任务 └─ worker 赛前备参数（slug / home_margin / 总分主线 
 - **让分覆盖概率**：把上式里的 lead 换成"当前分差 − 让分线"同理计算。
 - **总分概率**：按当前节奏推算终场总分，并把剩余时间得分波动（σ）算进去；离线 ≥10 分才谈概率。模型与市场价差过大时，先怀疑模型（如胶着局末段罚球潮），并在分析里写明分歧。**总分三节结束门禁（2026-10-25 用户拍板，第一优先级）**：period 小于 4 时总分不预测、不发，达标和捡漏都受限；period 到 4 才开始算总分。
 - **风险更新优先级（2026-10-26 用户拍板，最低优先级，POLICY_VERSION = "v1-20261026-risk-priority"）**：推送优先级 = 主推 > 固定节点 > 风险更新。风险更新（decision.py risk_send_allowed，sender.py RISK held 路径）只在 INVALIDATED、或 Q4/加时剩余 ≤ 5 分钟、或模型概率跌破推送门槛（达标 < 95%、捡漏 < 90%）时才发；其他 REVIEW（例如第三节、盘口重定价且价格仍在核价线以内）只记 risk_updates.jsonl 和 sender.log，不发 TG、不产生 SENT_RISK_MSG、不记 risk_alerts。风险更新永远只是提醒，不是卖出指令。
+- **总分加时风险提示（2026-10-26 用户要求考虑加时因素、助手推断，POLICY_VERSION = "v1-20261026-ot-warning"，可推+提示、不拦单）**：fast_check 的总分预测是常规时间预测，加时概率（P 终场分差落到 0）此前只打印、不调预测、不拦单。现改为：fast_check 计算 ot_scenario_total = 常规预测 + 当前节奏 × 5 分钟，结构化 game 和 total Under 候选带 ot_warning；Q4/加时、分差 ≤ 8 分且加时概率 ≥ 3% 或加时情景离线 < 20 分时，sender 在结论/节点消息后附带该提示（sender.py ot_warnings），大分不附（加时只帮大分）。提示不改原始概率、不挡推送、不改核价线。
 - **Gate 的关系**：用户在 Gate App 下单，Gate 的 Polymarket 板块与 Polymarket 同一订单簿、价格同源；Gate 另收单边 0.8% 手续费，显示刷新慢半拍、百分比常错位。**下单价以 Gate 卖盘实际价为准，接口价只是参考**（用户第一手 Gate 价优先于任何接口读数）。Gate 标 Predict.fun 来源的是另一个池子（币安同源），价格不同，必须提醒。Gate 只读 MCP 查不到 NBA 单场盘。
 
 ## 4. 推送规则（2026-10-24 定稿，覆盖一切旧口径）

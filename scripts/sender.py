@@ -326,6 +326,31 @@ def context_suffix(structured, top_key):
         return ""
 
 
+def ot_warnings(structured, keys):
+    """OT warnings for totals Under candidates in a message.
+
+    Push + warning, never a block (user 2026-10-26): returns the
+    fast_check ot_warning strings for the given sender keys, in order,
+    deduplicated. Empty when structured data is absent or no Under
+    candidate in the message carries a warning.
+    """
+    if not structured:
+        return []
+    try:
+        cands = structured.get("candidates_all") or []
+        out = []
+        for k in keys:
+            for c in cands:
+                if (c.get("kind"), c.get("market"), c.get("pick"), c.get("line")) == tuple(k):
+                    w = c.get("ot_warning")
+                    if w and w not in out:
+                        out.append(w)
+                    break
+        return out
+    except Exception:
+        return []
+
+
 def load_structured(path, max_age_sec=120, force=False):
     """Load a fast_check structured file, or None when missing/stale.
 
@@ -479,6 +504,9 @@ def main():
             spread_all = [(k, i) for k, i in items if k[1] == "spread"]
             if main_all:
                 node_msg = compose(state, main_all, spread_all, prefix=label)
+                _otw = ot_warnings(structured, [k for k, _ in main_all])
+                if _otw:
+                    node_msg = node_msg + "\n\n" + "\n".join(_otw)
                 _ctx = context_suffix(structured, main_all[0][0])
                 if _ctx:
                     node_msg = node_msg + "\n\n" + _ctx
@@ -559,6 +587,9 @@ def main():
         _pending_after = set(sig_of(k) for k, _ in _new_hits) if per >= 3 else set()
         if _send_main:
             msg = compose(state, _send_main, _send_spread)
+            _otw = ot_warnings(structured, [k for k, _ in _send_main])
+            if _otw:
+                msg = msg + "\n\n" + "\n".join(_otw)
             _ctx = context_suffix(structured, _send_main[0][0])
             if _ctx:
                 msg = msg + "\n\n" + _ctx
