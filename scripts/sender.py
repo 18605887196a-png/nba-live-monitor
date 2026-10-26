@@ -58,6 +58,10 @@ NAME_CN = {
 TG_PY = os.path.expanduser("~/workspace/custom-connectors/custom.telegram/bin/tg.py")
 FC_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fast_check.py")
 FC_DIR = os.path.dirname(os.path.abspath(__file__))
+# (D) Market-risk reasons live only in candidate decisions: tracked
+# evaluation is called with market=None, so a market-only risk never
+# advances the tracked episode. Its cycle is tracked separately.
+MARKET_RISK_REASONS = {"market_move_no_score", "spread_widening", "last_only_move"}
 
 # v1 context: decision helpers are optional; sender works without them
 # (text parsing remains the push path in bypass stage).
@@ -786,6 +790,35 @@ def main():
             for _tx in tracked:
                 if isinstance(_tx, dict):
                     _tracked_by_key[(_tx.get("market"), _tx.get("pick"), _tx.get("line"), _tx.get("kind"))] = _tx
+            # (D) Market-risk cycle update, for every sent line present
+            # this round (not just the one alerted, since at most one
+            # risk is sent per round). A fresh sample carrying a market
+            # reason starts a cycle; only a fresh sample proving the
+            # anomaly is gone (120s window classified no_anomaly or
+            # normal_repricing) ends it. A round with no candidate for
+            # the line (missing data) ends nothing.
+            if structured and _DECISION_OK:
+                for _c in structured.get("candidates_all") or []:
+                    _ck = f"{_c['market']}|{_c['pick']}|{_c['line']}"
+                    if _ck not in sent_at:
+                        continue
+                    _cdec = _c.get("decision") or {}
+                    _ckind = _cdec.get("kind") or _c.get("kind")
+                    _cent = _tracked_by_key.get((_c["market"], _c["pick"], _c["line"], _ckind))
+                    if _cent is None:
+                        continue
+                    _mreasons = [r for r in (_cdec.get("reason_codes") or []) if r in MARKET_RISK_REASONS]
+                    if _mreasons:
+                        if not _cent.get("market_risk_active"):
+                            _cent["market_cycle"] = int(_cent.get("market_cycle") or 0) + 1
+                            _cent["market_risk_active"] = True
+                        _cent["market_risk_reasons"] = _mreasons
+                    elif _cent.get("market_risk_active"):
+                        _mw = _c.get("market_windows") or {}
+                        _w120 = _mw.get(120, _mw.get("120", {})) if isinstance(_mw, dict) else {}
+                        _cls = _w120.get("classification") if isinstance(_w120, dict) else None
+                        if _cls in ("no_anomaly", "normal_repricing"):
+                            _cent["market_risk_active"] = False
             if structured and _DECISION_OK:
                 for _c in structured.get("candidates_all") or []:
                     _dec = _c.get("decision") or {}
@@ -803,6 +836,12 @@ def main():
                     _centry = _tracked_by_key.get((_c["market"], _c["pick"], _c["line"], _skey[0]))
                     _cep = int(_centry.get("episode") or 1) if _centry else 1
                     _cbase = f"{_ckey}|{_skey[0]}|{_cep}"
+                    # (D) A market risk is keyed by its market cycle, not
+                    # the prob episode (which never advances for market
+                    # risks): recovery then a second move is a new key
+                    # and fires again, while the same cycle stays deduped.
+                    if _centry is not None and any(r in MARKET_RISK_REASONS for r in _reasons):
+                        _cbase = f"{_cbase}|mkt{int(_centry.get('market_cycle') or 1)}"
                     if not should_send_risk(_cbase, _state_r, _reasons, risk_alerts):
                         continue
                     # Priority gate (user 2026-10-26): risk is lowest priority.
