@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261026-ot-warning"
+POLICY_VERSION = "v1-20261026-fixes"  # F1-F6: tracked review, Under quote fix, coverage-gated tags, scan_id
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime warning for totals (user 2026-10-26, inferred by assistant):
@@ -80,3 +80,18 @@ QUOTE_MAX_RECEIVED_AGE_SEC = 120
 # so cost is unknown, never zero. Set these explicitly to enable cost.
 TARGET_USD_DEFAULT = None
 FEE_PER_SHARE_DEFAULT = None
+
+# --- F6 single source (2026-10-26 fixes) ---
+# fast_check / decision / sender must read these instead of re-typing
+# 0.95 / 0.90 / 5.0 / 900 / 120 literals. Values are unchanged from the
+# live rules; only the source of truth moves here.
+HIT_PROB = 0.95
+LEAK_PROB = 0.90
+Q4_HIT_LATE_REMAINING_MIN = 5.0
+Q4_HIT_BLOWOUT_LEAD = 30
+TOTALS_MIN_ELAPSED_MIN = 15
+TOTALS_MIN_MARGIN = 10
+SENDER_COOLDOWN_SEC = 900
+SENDER_INTERVAL_SEC = 45
+MARKET_SCHEMA_VERSION = 2  # v2: total Under bid/ask are the same outcome
+TRACKED_COST_TIMEOUT_SEC = 5.0  # total book budget per scan, not per candidate

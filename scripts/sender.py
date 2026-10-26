@@ -34,7 +34,7 @@ Usage:
     [--chat ID] [--interval SECS] [--state FILE] [--log FILE]
     [--dry-run] [--test-input FILE] [--once] [--max-hours H]
 """
-import argparse, json, os, re, subprocess, sys, time
+import argparse, json, os, re, subprocess, sys, time, uuid
 
 TEAM_CN = {
     "ATL": "老鹰", "BKN": "篮网", "BOS": "凯尔特人", "CHA": "黄蜂", "CHI": "公牛",
@@ -66,6 +66,14 @@ try:
     _DECISION_OK = True
 except Exception:
     _DECISION_OK = False
+try:
+    from policy_config import HIT_PROB, LEAK_PROB, SENDER_COOLDOWN_SEC
+except Exception:
+    HIT_PROB, LEAK_PROB, SENDER_COOLDOWN_SEC = 0.95, 0.90, 900
+try:
+    from market_context import token_for_total
+except Exception:
+    token_for_total = None
 
 def cn(team):
     return TEAM_CN.get(team) or NAME_CN.get(team) or team
@@ -279,13 +287,23 @@ def load_state(path):
                 int(d.get("prev_per", 0)),
                 set(tuple(x) for x in d.get("pending", [])),
                 dict(d.get("sent_at", {})),
-                dict(d.get("risk_alerts", {})))
+                dict(d.get("risk_alerts", {})),
+                list(d.get("tracked_signals", [])))
     except Exception:
-        return set(), False, False, 0, set(), {}, {}
+        return set(), False, False, 0, set(), {}, {}, []
 
 
 def save_state(path, qualified, q3_node=False, q4_node=False, prev_per=0,
-               pending=None, sent_at=None, risk_alerts=None):
+               pending=None, sent_at=None, risk_alerts=None, tracked_signals=None):
+    # tracked_signals=None means "preserve what is already on disk":
+    # existing save_state callers that do not know about tracking must
+    # not wipe the tracked list.
+    if tracked_signals is None:
+        try:
+            with open(path) as _f:
+                tracked_signals = json.load(_f).get("tracked_signals", [])
+        except Exception:
+            tracked_signals = []
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump({"qualified": [list(x) for x in qualified],
@@ -293,8 +311,57 @@ def save_state(path, qualified, q3_node=False, q4_node=False, prev_per=0,
                    "prev_per": prev_per,
                    "pending": [list(x) for x in (pending or set())],
                    "sent_at": sent_at or {},
-                   "risk_alerts": risk_alerts or {}}, f)
+                   "risk_alerts": risk_alerts or {},
+                   "tracked_signals": tracked_signals or []}, f)
     os.replace(tmp, path)
+
+
+def register_tracked(tracked, event_id, keys, structured):
+    """Register successfully sent main candidates for F1 re-evaluation.
+
+    Only after a real send success (or a dry-run send, which the
+    caller already treats as sent for state purposes). Spread
+    attach-only lines are never registered: they are not formal
+    pushes. Existing entries are kept as-is (original send time and
+    episode are not reset by a later re-send of the same line).
+    """
+    if not isinstance(tracked, list):
+        return tracked
+    _cands = {}
+    if isinstance(structured, dict):
+        for _c in structured.get("candidates_all") or []:
+            _cands[(_c.get("kind"), _c.get("market"), _c.get("pick"), _c.get("line"))] = _c
+    _seen = {str(x.get("signal_id")) for x in tracked if isinstance(x, dict)}
+    for _k in keys:
+        _kind, _mkt, _pick, _line = _k
+        _sid = f"{event_id}:{_mkt}:{_pick}:{_line}:{_kind}"
+        if _sid in _seen:
+            continue
+        _sc = _cands.get(_k) or {}
+        _ident = _sc.get("identity") or {}
+        _asset = None
+        if _mkt == "total" and token_for_total is not None:
+            try:
+                _asset = token_for_total(_ident, _pick)
+            except Exception:
+                _asset = None
+        tracked.append({
+            "signal_id": _sid, "event_id": str(event_id),
+            "condition_id": _ident.get("condition_id"), "asset_id": _asset,
+            "market": _mkt, "pick": _pick, "line": _line,
+            "rules_key": f"{_mkt}|{_pick}|{_line}",
+            "original_kind": _kind,
+            "policy_version_at_send": (structured.get("policy_version") if isinstance(structured, dict) else None),
+            "threshold_at_send": LEAK_PROB if _kind in ("leak", "leak_plus") else HIT_PROB,
+            "original_conditions": {"threshold": LEAK_PROB if _kind in ("leak", "leak_plus") else HIT_PROB,
+                                    "min_margin": 10 if _mkt == "total" else None,
+                                    "leak_vs": _sc.get("leak_vs")},
+            "leak_vs": _sc.get("leak_vs"),
+            "sent_at": time.time(), "last_state": "WATCH", "last_reason_codes": [],
+            "episode": 1, "last_alert_episode": 0,
+        })
+        _seen.add(_sid)
+    return tracked
 
 
 def context_suffix(structured, top_key):
@@ -351,11 +418,14 @@ def ot_warnings(structured, keys):
         return []
 
 
-def load_structured(path, max_age_sec=120, force=False):
+def load_structured(path, max_age_sec=120, force=False, scan_id=None, event_id=None):
     """Load a fast_check structured file, or None when missing/stale.
 
     force=True is for test mode (SENDER_STRUCTURED_FILE), where the
     file is intentionally pre-made and age is irrelevant.
+    In normal mode the file must carry THIS cycle's scan_id and this
+    event_id: a fresh-looking file from a previous cycle (or another
+    game) is rejected, never spliced onto this cycle's text output.
     """
     try:
         if not path or not os.path.exists(path):
@@ -363,7 +433,13 @@ def load_structured(path, max_age_sec=120, force=False):
         if not force and time.time() - os.path.getmtime(path) > max_age_sec:
             return None
         with open(path) as f:
-            return json.load(f)
+            d = json.load(f)
+        if not force:
+            if scan_id is not None and d.get("scan_id") != scan_id:
+                return None
+            if event_id is not None and str(d.get("event_id")) != str(event_id):
+                return None
+        return d
     except Exception:
         return None
 
@@ -382,7 +458,7 @@ def tg_send(text, chat_id):
     except Exception:
         return False
 
-def run_fast_check(date, spec, test_input, structured_path=None, target_usd=None):
+def run_fast_check(date, spec, test_input, structured_path=None, target_usd=None, scan_id=None, tracked_path=None):
     if test_input:
         with open(test_input) as f:
             return f.read()
@@ -390,10 +466,16 @@ def run_fast_check(date, spec, test_input, structured_path=None, target_usd=None
     env["FC_EARLY_LOG_ONLY"] = "1"
     if structured_path:
         env["FC_STRUCTURED_OUT"] = structured_path
+    if scan_id:
+        env["FC_SCAN_ID"] = scan_id
+    if tracked_path:
+        env["FC_TRACKED_FILE"] = tracked_path
     if target_usd is not None:
         env["FC_TARGET_USD"] = str(target_usd)
     r = subprocess.run([sys.executable, FC_PY, date, spec],
                        capture_output=True, text=True, timeout=40, cwd=FC_DIR, env=env)
+    if r.returncode != 0:
+        raise RuntimeError(f"fast_check exit {r.returncode}")
     return r.stdout
 
 
@@ -431,17 +513,22 @@ def main():
     ap.add_argument("--target-usd", type=float, default=None,
                     help="target USD for cost calculation; unset means cost unknown, never zero")
     a = ap.parse_args()
-    prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts = load_state(a.state)
+    prev, q3_node, q4_node, prev_per, pending, sent_at, risk_alerts, tracked = load_state(a.state)
     _event_id = a.spec.split(":")[0] if ":" in a.spec else a.spec
     _structured_path = a.state + ".structured.json"
+    _tracked_path = a.state + ".tracked.json"
     t0 = time.time()
     while True:
         if time.time() - t0 > a.max_hours * 3600:
             log_msg(a.log, "MAX_HOURS exit")
             return 0
+        _scan_id = uuid.uuid4().hex
         try:
+            with open(_tracked_path, "w") as _tf:
+                json.dump({"tracked_signals": tracked}, _tf)
             out = run_fast_check(a.date, a.spec, a.test_input,
-                                 structured_path=_structured_path, target_usd=a.target_usd)
+                                 structured_path=_structured_path, target_usd=a.target_usd,
+                                 scan_id=_scan_id, tracked_path=_tracked_path)
         except Exception as e:
             log_msg(a.log, f"FAST_CHECK ERROR {type(e).__name__}")
             if a.once:
@@ -454,7 +541,7 @@ def main():
         if a.test_input and _test_struct:
             structured = load_structured(_test_struct, force=True)
         else:
-            structured = load_structured(_structured_path)
+            structured = load_structured(_structured_path, scan_id=_scan_id, event_id=_event_id)
         if status == "final":
             log_msg(a.log, "STATUS final exit")
             return 0
@@ -490,7 +577,7 @@ def main():
         # Cooldown (user 2026-10-25): a line sent within 15 min never resends,
         # even if it dropped out and returned (kills flicker spam).
         _now = time.time()
-        newly = [(k, i) for k, i in newly if _now - sent_at.get(sig_key(k), 0) >= 900]
+        newly = [(k, i) for k, i in newly if _now - sent_at.get(sig_key(k), 0) >= SENDER_COOLDOWN_SEC]
         newly_main = [(k, i) for k, i in newly if k[1] != "spread"]
         newly_spread = [(k, i) for k, i in newly if k[1] == "spread"]
         node_kind = None
@@ -534,7 +621,7 @@ def main():
                 pending = set()
                 for k, _ in main_all + spread_all:
                     sent_at[sig_key(k)] = time.time()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
             else:
                 ok = tg_send(node_msg, a.chat)
                 log_msg(a.log, f"NODE {node_kind} {'ok' if ok else 'FAILED'} main={len(main_all)} spread={len(spread_all)}")
@@ -543,6 +630,7 @@ def main():
                     # v1: a node send counts as a send for cooldown and
                     # for experience (main candidates only).
                     _mark_sent(a.date, _event_id, main_all)
+                    register_tracked(tracked, _event_id, [k for k, _ in main_all], structured)
                 if ok:
                     if node_kind == "q3":
                         q3_node = True
@@ -554,7 +642,7 @@ def main():
                     pending = set()
                     for k, _ in main_all + spread_all:
                         sent_at[sig_key(k)] = time.time()
-                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
                 # on failure flags stay: next cycle retries
             if a.once:
                 return 0
@@ -574,7 +662,7 @@ def main():
                 log_msg(a.log, f"GATED early Q{per} newly={len(newly_main)} logged-only")
                 prev = cur
                 pending = set()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
                 if a.once:
                     return 0
                 time.sleep(a.interval)
@@ -599,25 +687,26 @@ def main():
                 pending = _pending_after
                 for k, _ in _send_main + _send_spread:
                     sent_at[sig_key(k)] = time.time()
-                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
             else:
                 ok = tg_send(msg, a.chat)
                 log_msg(a.log, f"SEND {'ok' if ok else 'FAILED'} newly={len(_send_main)} spread={len(_send_spread)}")
                 if ok:
                     log_msg(a.log, "SENT_MSG:\n" + msg)
                     _mark_sent(a.date, _event_id, _send_main)
+                    register_tracked(tracked, _event_id, [k for k, _ in _send_main], structured)
                 if ok:
                     prev = cur
                     pending = _pending_after
                     for k, _ in _send_main + _send_spread:
                         sent_at[sig_key(k)] = time.time()
-                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+                    save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
                 # on failure prev/pending/sent_at stay: next cycle retries
         elif _new_hits:
             log_msg(a.log, f"PENDING {len(_new_hits)} awaiting confirmation")
             prev = cur
             pending = set(sig_of(k) for k, _ in _new_hits)
-            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
         else:
             # v1 risk escalation: a previously sent line whose structured
             # decision is now REVIEW/INVALIDATED with NEW reasons is sent
@@ -682,11 +771,68 @@ def main():
                                 pass
                             _risk_sent = True
                     break
+            # F1 tracked risk: previously sent lines re-evaluated this
+            # round, even when they no longer qualify as new pushes.
+            # State is updated for every evaluation; an alert is only
+            # marked after a successful send (or a dry-run send).
+            if structured and _DECISION_OK:
+                _by_sid = {str(x.get("signal_id")): x for x in tracked if isinstance(x, dict)}
+                for _tev in structured.get("tracked_evaluations") or []:
+                    _sid = str(_tev.get("signal_id"))
+                    _entry = _by_sid.get(_sid)
+                    if _entry is None:
+                        continue
+                    _tdec = _tev.get("decision") or {}
+                    _tstate = _tdec.get("state")
+                    _treasons = _tdec.get("reason_codes") or []
+                    if _tstate == "WATCH" and _entry.get("last_state") in ("REVIEW", "INVALIDATED"):
+                        _entry["episode"] = int(_entry.get("episode") or 1) + 1
+                        _entry["last_state"] = "WATCH"
+                        _entry["last_reason_codes"] = []
+                    elif _tstate in ("REVIEW", "INVALIDATED", "CLOSED"):
+                        _entry["last_state"] = _tstate
+                        _entry["last_reason_codes"] = _treasons
+                    if _risk_sent or _tstate not in ("REVIEW", "INVALIDATED") or not _treasons:
+                        continue
+                    _game_ctx2 = structured.get("game") if isinstance(structured, dict) else None
+                    if not risk_send_allowed(_tstate, _tev.get("kind"), _tev.get("raw_prob"), _game_ctx2):
+                        log_msg(a.log, f"RISK held (tracked, priority gate) {_sid} {_tstate} period={per} reasons={','.join(_treasons)}")
+                        continue
+                    _talert = f"{_sid}|{_entry.get('episode')}|{_tstate}|{','.join(sorted(_treasons))}"
+                    if _talert in risk_alerts:
+                        continue
+                    _tkey = (_tev.get("kind"), _tev.get("market"), _tev.get("pick"), _tev.get("line"))
+                    _tcn = "需复核" if _tstate == "REVIEW" else "原条件失效"
+                    _trtxt = "；".join(_tdec.get("reasons_text") or _treasons)
+                    _tmsg = (f"{state_line(state)}\n\n风险更新：{fmt_main(_tkey, {'price': _tev.get('raw_price') * 100 if _tev.get('raw_price') is not None else None, 'prob': (_tev.get('raw_prob') * 100 if _tev.get('raw_prob') is not None else None), 'text': ''}, False, state['ot'])}\n"
+                             f"状态：{_tcn}｜原因：{_trtxt}\n说明：先前条件已变化，仅作提醒，不是卖出指令")
+                    if a.dry_run:
+                        log_msg(a.log, "DRY-RUN tracked risk would send:\n" + _tmsg)
+                        risk_alerts[_talert] = time.time()
+                        _entry["last_alert_episode"] = _entry.get("episode")
+                        _risk_sent = True
+                    else:
+                        _tok = tg_send(_tmsg, a.chat)
+                        log_msg(a.log, f"RISK {'ok' if _tok else 'FAILED'} (tracked) {_sid} {_tstate}")
+                        if _tok:
+                            log_msg(a.log, "SENT_RISK_MSG:\n" + _tmsg)
+                            risk_alerts[_talert] = time.time()
+                            _entry["last_alert_episode"] = _entry.get("episode")
+                            try:
+                                sys.path.insert(0, FC_DIR)
+                                import experience as _exp_t
+                                _exp_t.log_risk({"date_us": a.date, "event_id": str(_event_id),
+                                                 "market": _tev.get("market"), "pick": _tev.get("pick"), "line": _tev.get("line"),
+                                                 "kind": _tev.get("kind"), "state": _tstate,
+                                                 "reason_codes": _treasons, "episode": _entry.get("episode")})
+                            except Exception:
+                                pass
+                            _risk_sent = True
             if not _risk_sent:
                 log_msg(a.log, f"STATUS live nothing-new qualified={len(cur)}")
             prev = cur
             pending = set()
-            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts)
+            save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
         if a.once:
             return 0
         time.sleep(a.interval)

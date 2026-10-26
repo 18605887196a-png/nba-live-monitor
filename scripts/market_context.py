@@ -56,6 +56,12 @@ def parse_gamma_market(m):
             tokens = json.loads(tokens)
         except Exception:
             tokens = None
+    outcomes = m.get("outcomes")
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except Exception:
+            outcomes = None
     return {
         "condition_id": cond,
         "market_id": m.get("id"),
@@ -65,7 +71,47 @@ def parse_gamma_market(m):
         "ask": m.get("bestAsk"),
         "last": m.get("lastTradePrice"),
         "token_ids": tokens,
+        "outcomes": outcomes,
     }
+
+
+def token_for_total(identity, pick):
+    """Token id for a totals pick, or None when identity is unknown.
+
+    Totals markets are binary Yes/No for Over: outcomes ["Yes", "No"]
+    means token_ids[0] is Over and token_ids[1] is Under. An
+    ["Over", "Under"] outcomes list means the same order directly.
+    Anything else (missing outcomes, missing tokens, other orders)
+    returns None: callers must NOT guess a token, and must report
+    cost as unknown, never from the other side's book.
+    """
+    if not isinstance(identity, dict):
+        return None
+    tokens = identity.get("token_ids")
+    outcomes = identity.get("outcomes")
+    if not isinstance(tokens, (list, tuple)) or len(tokens) < 2:
+        return None
+    if outcomes == ["Yes", "No"]:
+        return tokens[0] if pick == "Over" else tokens[1]
+    if outcomes == ["Over", "Under"]:
+        return tokens[0] if pick == "Over" else tokens[1]
+    return None
+
+
+def normalize_under_quote(over_bid, over_ask):
+    """Under Yes quote derived from the Over Yes quote.
+
+    Under bid = 1 - Over ask, Under ask = 1 - Over bid. Both fields
+    must describe the SAME outcome; returning the Over bid as the
+    Under bid (the old fast_check bug) fabricates a 60c-wide spread
+    from a 2c-wide one.
+    """
+    try:
+        if over_bid is None or over_ask is None:
+            return None, None
+        return 1.0 - float(over_ask), 1.0 - float(over_bid)
+    except Exception:
+        return None, None
 
 
 def contract_key(identity):
@@ -224,6 +270,7 @@ def market_window_features(history, current, score_changed=None):
             cls = "no_anomaly"
         out[w] = {
             "status": "ok",
+            "coverage_status": "full" if coverage >= 1.0 else "partial",
             "actual_delta_sec": round(delta, 1),
             "coverage": coverage,
             "bid_change_c": bid_ch,
@@ -239,23 +286,47 @@ def market_window_features(history, current, score_changed=None):
 def fetch_book(token_id, timeout=10):
     """Fetch a CLOB book for one token. Returns (asks, bids) or (None, None).
 
-    asks/bids are lists of (price, size) sorted best-first. Any failure
-    yields (None, None) with depth_status unknown; callers must never
-    treat that as empty depth.
+    Endpoint (official docs, prices-order-books): the REST book read
+    uses the lowercase ``token_id`` parameter, e.g.
+    ``https://clob.polymarket.com/book?token_id=<id>``. The old code
+    used ``tokenID=``; that spelling is not the documented one.
+    Asks/bids are lists of (price, size) sorted best-first. Levels may
+    arrive as {"price":..,"size":..} dicts or [price, size] pairs; both
+    are accepted, invalid levels are dropped, prices outside (0, 1]
+    and negative sizes are dropped. Any transport/parse failure yields
+    (None, None) = unknown depth, never empty depth. A successful
+    response with an empty ask side yields ([], []) = known no depth.
     """
     if not token_id:
         return None, None
     try:
+        import math as _math
         req = urllib.request.Request(
-            f"https://clob.polymarket.com/book?tokenID={token_id}",
+            f"https://clob.polymarket.com/book?token_id={token_id}",
             headers={"User-Agent": "Mozilla/5.0"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.load(r)
-        asks = [(float(x["price"]), float(x["size"])) for x in d.get("asks", [])]
-        bids = [(float(x["price"]), float(x["size"])) for x in d.get("bids", [])]
-        asks.sort(key=lambda x: x[0])
-        bids.sort(key=lambda x: -x[0])
+        if not isinstance(d, dict) or "asks" not in d or "bids" not in d:
+            return None, None
+        def _levels(raw):
+            out = []
+            for x in raw or []:
+                try:
+                    if isinstance(x, dict):
+                        pr, sz = float(x["price"]), float(x["size"])
+                    else:
+                        pr, sz = float(x[0]), float(x[1])
+                except Exception:
+                    continue
+                if not (_math.isfinite(pr) and _math.isfinite(sz)):
+                    continue
+                if not (0 < pr <= 1.0) or sz < 0:
+                    continue
+                out.append((pr, sz))
+            return out
+        asks = sorted(_levels(d.get("asks")), key=lambda x: x[0])
+        bids = sorted(_levels(d.get("bids")), key=lambda x: -x[0])
         return asks, bids
     except Exception:
         return None, None
@@ -275,6 +346,7 @@ def cost_for_target(asks, target_usd, fee_per_share=None):
     if asks is None or target_usd is None:
         return {
             "status": "unknown",
+            "book_status": "unknown",
             "reason": "no_book_or_no_target",
             "avg_price": None,
             "filled_usd": None,
@@ -282,10 +354,21 @@ def cost_for_target(asks, target_usd, fee_per_share=None):
             "fill_complete": None,
             "cost_per_share_incl_fee": None,
         }
+    if len(asks) == 0:
+        return {
+            "status": "empty",
+            "book_status": "empty",
+            "reason": "empty_book",
+            "avg_price": None,
+            "filled_usd": 0.0,
+            "filled_shares": 0.0,
+            "fill_complete": False,
+            "cost_per_share_incl_fee": None,
+        }
     try:
         target = float(target_usd)
     except Exception:
-        return {"status": "unknown", "reason": "bad_target", "avg_price": None,
+        return {"status": "unknown", "book_status": "unknown", "reason": "bad_target", "avg_price": None,
                 "filled_usd": None, "filled_shares": None, "fill_complete": None,
                 "cost_per_share_incl_fee": None}
     remaining = target
@@ -306,13 +389,14 @@ def cost_for_target(asks, target_usd, fee_per_share=None):
             shares += take
             remaining = 0.0
     if shares <= 0:
-        return {"status": "unknown", "reason": "empty_book", "avg_price": None,
+        return {"status": "empty", "book_status": "empty", "reason": "empty_book", "avg_price": None,
                 "filled_usd": 0.0, "filled_shares": 0.0, "fill_complete": False,
                 "cost_per_share_incl_fee": None}
     avg = spent / shares
     cost = avg + float(fee_per_share) if fee_per_share is not None else None
     return {
         "status": "ok" if remaining <= 0 else "partial",
+        "book_status": "ok",
         "avg_price": round(avg, 6),
         "filled_usd": round(spent, 2),
         "filled_shares": round(shares, 2),

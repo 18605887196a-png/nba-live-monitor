@@ -145,3 +145,14 @@
 - 常驻版想要更低延迟时改用 Polymarket CLOB 的 websocket 通道 wss://ws-subscriptions-clob.polymarket.com/ws/market 订阅胜负盘 token，单场临时监控用 20 秒 REST 轮询已经够，延迟差对用户手动下单没有实际影响
 
 - 模型想更准时可以用 Pinnacle 滚球赔率做第二基准交叉验证，两边模型相差超过 4 个百分点时以更保守的一边为准
+
+## F1-F6 补齐（2026-10-26，POLICY_VERSION = "v1-20261026-fixes"，代码未改推送门槛）
+
+- **阈值单一来源**：达标 95%、捡漏 90%、Q4 门禁、总分门禁、冷却 900 秒等统一读 `policy_config.py`，fast_check/decision/sender 不再各写一套字面值。数值与此前现行规则一致。
+- **已推候选持续复查（F1）**：sender 在真实发送成功后把候选登记到 state 的 `tracked_signals`（含合约身份、原门槛、原条件、episode）；fast_check 每轮用本轮行情重算已推线，输出 `tracked_evaluations`。跌破原门槛 → INVALIDATED（`probability_below_threshold`，仅作提醒、不等于必输、不触发卖出）；本轮行情缺失 → REVIEW（`data_missing`），不说它必输；比赛终场 → CLOSED。同一风险同一 episode 只提醒一次，恢复后再次失效开新 episode。风险发送仍受 2026-10-26 风险门禁约束（INVALIDATED、Q4 晚段、概率跌破门槛才发，其余只记日志）。
+- **小分报价（F2）**：小分 Under 的 bid/ask 统一为同一 outcome：bid = 1 - 大分 ask，ask = 1 - 大分 bid；买价本身一直是对的。市场历史按合约身份过滤，旧版小分快照（schema_version < 2）不混入新窗口；合约更换不沿用旧合约窗口。
+- **过程风险（F3）**：比赛窗口显式区分 full/partial/unknown，部分窗口只展示实际观察变化，不触发“近 5 分钟”阈值；领先缩小只在胜负候选且所选球队确实领先且优势缩小达到阈值时才算不利，落后队追分不算不利；时钟回退/比分修正跨越的窗口标为 history_anomaly，不当正常趋势。
+- **轮次与时间（F4）**：sender 每轮生成 scan_id 传给 fast_check，结构化输出必须带本轮 scan_id 与本场 event_id 否则 sender 拒用；fast_check 退出码非 0 时 sender 不用旧文件；行情年龄按实际 gamma 接收时间算，不再恒为 0；决策异常 → REVIEW + context_error，不兜底 WATCH；非法时钟 → DATA_ERROR，不产生概率。
+- **成本（F5）**：仅对已展示的总分候选接 Polymarket CLOB 订单簿（`book?token_id=`，官方文档口径），小分查小分 token、不拿 Over 订单簿代替；胜负/让分 token 映射未核实，成本仍写未知、不猜。目标金额是不含费买入金额，另报含费支出；费用未知时含费成本为 null；深度不足与请求失败分开（empty vs unknown）；总核价预算 5 秒，超时返回未知、不拖整轮。Polymarket 订单簿只是参考，不能表示已核实 Gate 实际成交成本。
+- **节点空播报（F6 口径如实说明）**：固定节点无够格主盘时，sender 仍发一句话状态版（如“【三节结束】…，暂无够格线”），这是节点保证，不是漏发；节点与主推同轮时节点分支先执行，风险顺延到下一轮用新快照复核（不丢弃、不发已恢复的旧告警）。
+

@@ -35,10 +35,12 @@ def parse_clock_seconds(clock):
     """ESPN displayClock -> seconds remaining in the current period.
 
     Accepts "12:00", "5:22", "43.5" (bare seconds under a minute) and
-    "0.0". Unparseable input returns 0.0, never a fabricated value.
+    "0.0". Unparseable input returns None, never 0.0: 0.0 means period
+    end, and returning it for a bad clock would fabricate a final-like
+    probability. Callers must treat None as a data error.
     """
     if clock is None:
-        return 0.0
+        return None
     s = str(clock).strip()
     try:
         if ":" in s:
@@ -46,7 +48,7 @@ def parse_clock_seconds(clock):
             return float(m) * 60.0 + float(sec)
         return float(s)
     except Exception:
-        return 0.0
+        return None
 
 
 def game_time(period, clock):
@@ -68,7 +70,10 @@ def game_time(period, clock):
         per = int(period)
     except Exception:
         return 0.0, 48.0, False
-    clk_min = parse_clock_seconds(clock) / 60.0
+    _clk = parse_clock_seconds(clock)
+    if _clk is None:
+        return None, None, False
+    clk_min = _clk / 60.0
     if per >= 5:
         elapsed = 48.0 + (per - 5) * 5.0 + (5.0 - clk_min)
         return elapsed, clk_min, True
@@ -151,46 +156,87 @@ class SnapshotHistory:
                             continue
         except Exception:
             pass
-        out.sort(key=lambda r: r.get("elapsed_min", 0.0))
+        # Received order, NOT elapsed order: sorting by elapsed would hide
+        # clock regressions and score corrections. Callers that need a
+        # monotonic trend must detect anomalies explicitly (see
+        # window_features), not sort them away.
+        out.sort(key=lambda r: r.get("received_epoch", 0.0))
         return out
 
 
 def window_features(history, current):
     """2/5-minute game-time windows from snapshot history.
 
-    history: list of snapshots with elapsed_min, lead, tot, scores.
-    current: dict with elapsed_min, lead, tot, home_score, away_score.
+    history: snapshots in RECEIVED order with elapsed_min, lead, tot,
+    scores. current: dict with elapsed_min, lead, tot, home_score,
+    away_score.
     Returns {window_min: feature} where feature is either a dict with
-    actual_start_elapsed, actual_delta_min, coverage, lead_change,
-    home_delta, away_delta, tot_delta, scoring_pace_per_min, or
-    {"status": "unknown", "reason": "no_history"} when no earlier
-    snapshot exists. A snapshot after the window start gives partial
-    coverage (< 1.0) and its actual delta is reported, never assumed
-    to equal the window length. Wall-clock gaps (pauses) do not enter
-    this calculation at all: only game elapsed matters.
+    actual_start_elapsed, actual_delta_min, coverage, coverage_status
+    ("full"/"partial"), lead_change, home_delta, away_delta,
+    tot_delta, scoring_pace_per_min, or {"status": "unknown",
+    "reason": ...} when no earlier snapshot exists, when the window
+    spans a detected history anomaly (clock regression or score
+    correction), or when there is no elapsed delta. A partial window
+    reports its actual observed change and coverage; it never claims
+    to be a full 5-minute window, and risk_tags only fires its
+    5-minute thresholds on full windows. Wall-clock gaps (pauses) do
+    not enter this calculation at all: only game elapsed matters.
     """
     out = {}
     cur_el = float(current.get("elapsed_min", 0.0))
+    # Anomaly points (in received order): elapsed going backwards, or
+    # a score/total going down while elapsed goes up (a correction).
+    # A window that spans such a point is unknown, not a trend.
+    anomalies = []
+    _max_el = None
+    _prev = None
+    for s in history or []:
+        try:
+            el = float(s.get("elapsed_min", 0.0))
+        except Exception:
+            continue
+        if _max_el is not None and el < _max_el - 0.01:
+            anomalies.append(el)
+        if _prev is not None:
+            try:
+                if el > float(_prev.get("elapsed_min", 0.0)) and (
+                    float(s.get("home_score", 0)) < float(_prev.get("home_score", 0))
+                    or float(s.get("away_score", 0)) < float(_prev.get("away_score", 0))
+                    or float(s.get("tot", 0)) < float(_prev.get("tot", 0))
+                ):
+                    anomalies.append(el)
+            except Exception:
+                pass
+        if _max_el is None or el > _max_el:
+            _max_el = el
+        _prev = s
     for w in GAME_WINDOWS_MIN:
         target = cur_el - float(w)
         earlier = [s for s in history if float(s.get("elapsed_min", 0.0)) < cur_el]
         if not earlier:
-            out[w] = {"status": "unknown", "reason": "no_history"}
+            out[w] = {"status": "unknown", "reason": "no_history", "coverage_status": "unknown"}
             continue
-        # Latest snapshot at or before the window start = full coverage.
-        # Otherwise the latest snapshot before now = partial coverage.
         full = [s for s in earlier if float(s.get("elapsed_min", 0.0)) <= target]
         if full:
-            base = full[-1]
+            # Base is the latest GAME-time snapshot at/before target,
+            # not the last received one: a regressed snapshot that
+            # arrives late must not become the window base.
+            base = max(full, key=lambda s: float(s.get("elapsed_min", 0.0)))
             coverage = 1.0
         else:
-            base = earlier[-1]
+            base = max(earlier, key=lambda s: float(s.get("elapsed_min", 0.0)))
             base_el = float(base.get("elapsed_min", 0.0))
             coverage = round((cur_el - base_el) / float(w), 3) if w else 0.0
         base_el = float(base.get("elapsed_min", 0.0))
         delta = cur_el - base_el
         if delta <= 0:
-            out[w] = {"status": "unknown", "reason": "no_elapsed_delta"}
+            out[w] = {"status": "unknown", "reason": "no_elapsed_delta", "coverage_status": "unknown"}
+            continue
+        if any(base_el < a <= cur_el for a in anomalies):
+            out[w] = {"status": "unknown", "reason": "history_anomaly",
+                      "coverage_status": "unknown",
+                      "actual_start_elapsed": base_el,
+                      "actual_delta_min": round(delta, 3)}
             continue
         lead_change = float(current.get("lead", 0)) - float(base.get("lead", 0))
         home_delta = float(current.get("home_score", 0)) - float(base.get("home_score", 0))
@@ -198,6 +244,7 @@ def window_features(history, current):
         tot_delta = float(current.get("tot", 0)) - float(base.get("tot", 0))
         out[w] = {
             "status": "ok",
+            "coverage_status": "full" if coverage >= 1.0 else "partial",
             "actual_start_elapsed": base_el,
             "actual_delta_min": round(delta, 3),
             "coverage": coverage,
@@ -205,7 +252,6 @@ def window_features(history, current):
             "home_delta": home_delta,
             "away_delta": away_delta,
             "tot_delta": tot_delta,
-            # Scoring pace only: points per game minute, not possessions.
             "scoring_pace_per_min": round(tot_delta / delta, 3),
         }
     return out
@@ -225,7 +271,9 @@ def risk_tags(current, windows, candidate=None):
     rem = float(current.get("remaining_min", 0.0))
     lead = float(current.get("lead", 0))
     w5 = windows.get(5, {}) if isinstance(windows, dict) else {}
-    if w5.get("status") == "ok":
+    # Full-window rule only: a partial window may be displayed as an
+    # observed change, but it must not trigger a "5-minute" threshold.
+    if w5.get("status") == "ok" and w5.get("coverage_status", "full" if w5.get("coverage", 0) >= 1.0 else "partial") == "full":
         lc = float(w5.get("lead_change", 0.0))
         # Lead moved toward zero by a notable amount in 5 game minutes.
         if abs(lead) < abs(lead - lc) and abs(lc) >= 5:

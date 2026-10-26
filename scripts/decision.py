@@ -41,12 +41,18 @@ try:
         POLICY_VERSION,
         MODEL_VERSION,
         QUOTE_MAX_RECEIVED_AGE_SEC,
+        HIT_PROB,
+        LEAK_PROB,
+        RISK_SEND_LATE_REMAINING_MIN,
     )
 except Exception:  # pragma: no cover
     LEAD_NARROW_POINTS_5M = 10
     POLICY_VERSION = "v1-bypass-20261025"
     MODEL_VERSION = "fast_check-20261025-wp-pace"
     QUOTE_MAX_RECEIVED_AGE_SEC = 120
+    HIT_PROB = 0.95
+    LEAK_PROB = 0.90
+    RISK_SEND_LATE_REMAINING_MIN = 5.0
 
 REASON_TEXT = {
     "identity_mismatch": "合约身份不匹配（换线/换合约，不能按原合约算涨跌）",
@@ -59,6 +65,8 @@ REASON_TEXT = {
     "spread_widening": "买卖价差明显扩大，流动性异常",
     "last_only_move": "只有旧成交价跳动，当前买卖报价未确认",
     "process_lead_narrowing": "近5分钟领先优势明显缩小，与候选方向相反",
+    "probability_below_threshold": "模型概率已跌破推送门槛",
+    "data_missing": "本轮行情缺失，无法确认原条件是否成立",
     "process_blowout_tail": "大比分领先进入收尾，胜负与让分须分开看",
     "process_close_late": "比分接近进入末节，可能进入犯规阶段",
     "cost_unverifiable_target": "已设目标金额但订单簿不足，无法确认全额成本",
@@ -95,6 +103,21 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
         reasons = ["market_closed" if market_closed else "base_condition_false"]
         return _build(key, candidate, state, reasons, missing, cost)
 
+    # Missing tracked data is REVIEW, not a proven failure: a contract
+    # absent from this round's book may simply be unlisted this poll.
+    if candidate.get("data_status") == "missing":
+        return _build(key, candidate, "REVIEW", ["data_missing"], ["market_data"], cost)
+    # Tracked original condition: a reliable new probability below the
+    # threshold at send time means the original push condition no
+    # longer holds. This is INVALIDATED in the decision sense only;
+    # it does not mean the bet must lose and never triggers a sell.
+    _tracked_thresh = candidate.get("tracked_threshold")
+    if _tracked_thresh is not None and raw_prob is not None:
+        try:
+            if float(raw_prob) < float(_tracked_thresh):
+                reasons.append("probability_below_threshold")
+        except Exception:
+            pass
     # INVALIDATED: explicit conditions only.
     if candidate.get("identity_mismatch"):
         reasons.append("identity_mismatch")
@@ -134,12 +157,36 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
     if process and isinstance(process, dict):
         tags = process.get("risk_tags") or []
     if "lead_narrowing_large_5m" in tags:
-        # Only a review when it runs against the candidate's direction.
+        # Direction-aware, and full-window only. The tag alone says
+        # "the absolute lead narrowed"; it does NOT say it narrowed
+        # against this candidate. A trailing team whose deficit
+        # shrinks is helped, not hurt, by the same move.
         # ML candidate direction is the picked team; totals have no
         # lead direction, so a narrowing lead alone is not a totals
         # review reason in v1 (it is still shown as process fact).
         if candidate.get("market") == "ml":
-            reasons.append("process_lead_narrowing")
+            _w5 = {}
+            if process and isinstance(process, dict):
+                _wins = process.get("windows") or {}
+                _w5 = _wins.get(5, _wins.get("5", {})) if isinstance(_wins, dict) else {}
+            _cov_full = _w5.get("coverage_status") == "full" or _w5.get("coverage", 0) >= 1.0
+            _home_abbr = game.get("home_abbr") if isinstance(game, dict) else None
+            _away_abbr = game.get("away_abbr") if isinstance(game, dict) else None
+            _pick = candidate.get("pick")
+            _lead_home = game.get("lead") if isinstance(game, dict) else None
+            _lc = _w5.get("lead_change")
+            _adverse = False
+            if _cov_full and _pick in (_home_abbr, _away_abbr) and _lead_home is not None and _lc is not None:
+                try:
+                    _picked_now = float(_lead_home) if _pick == _home_abbr else -float(_lead_home)
+                    _picked_ch = float(_lc) if _pick == _home_abbr else -float(_lc)
+                    _picked_base = _picked_now - _picked_ch
+                    # Was leading, and that lead shrank by the threshold.
+                    _adverse = _picked_base > 0 and _picked_ch <= -float(LEAD_NARROW_POINTS_5M)
+                except Exception:
+                    _adverse = False
+            if _adverse:
+                reasons.append("process_lead_narrowing")
     if "blowout_tail" in tags and candidate.get("market") in ("ml", "spread"):
         # Shown as a caution, not a hard review, unless the candidate
         # is a spread: late blowout margin is the least stable.
@@ -202,7 +249,7 @@ def risk_send_allowed(state, kind, raw_prob, game):
     if state != "REVIEW":
         return False
     if raw_prob is not None:
-        thresh = 0.90 if kind in ("leak", "leak_plus") else 0.95
+        thresh = LEAK_PROB if kind in ("leak", "leak_plus") else HIT_PROB
         if raw_prob < thresh:
             return True
     if isinstance(game, dict):
@@ -211,7 +258,7 @@ def risk_send_allowed(state, kind, raw_prob, game):
             rem = float(game.get("remaining_min")) if game.get("remaining_min") is not None else None
         except Exception:
             per, rem = 0, None
-        if per >= 4 and rem is not None and rem <= 5.0:
+        if per >= 4 and rem is not None and rem <= RISK_SEND_LATE_REMAINING_MIN:
             return True
     return False
 
