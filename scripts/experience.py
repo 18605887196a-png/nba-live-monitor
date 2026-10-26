@@ -326,19 +326,36 @@ def stats():
     # at 96% must calibrate as 96%. Formal records without sent_prob
     # (old data) are counted separately and never silently borrow
     # the detected prob into the calibration mean.
-    print("calibration (send-time prob vs actual, formal delivered only):")
-    cal_known = [r for r in formal if r.get("sent_prob") is not None]
+    # (F, follow-up) Calibration buckets, n, mean and hit rate must
+    # all come from the SAME sample: sent records with a send-time
+    # prob AND a settled win/loss. The previous version bucketed every
+    # sent record with sent_prob (including unsettled ones) but
+    # counted n only from wins/losses, so one settled 96% win plus
+    # one unsettled 99% printed n=1 with avg 97.5%. Unsettled, pushed
+    # and sent_prob-unknown records are listed separately, never
+    # mixed into the win/loss calibration.
+    print("calibration (send-time prob vs actual, formal delivered and settled only):")
+    cal_settled = [r for r in formal if r.get("sent_prob") is not None and r.get("result") in ("win", "loss")]
+    cal_unsettled = [r for r in formal if r.get("sent_prob") is not None and r.get("result") is None]
+    cal_push = [r for r in formal if r.get("sent_prob") is not None and r.get("result") == "push"]
     cal_unknown = [r for r in formal if r.get("sent_prob") is None]
     for lo, hi in ((0.85, 0.90), (0.90, 0.95), (0.95, 1.01)):
-        rows = [r for r in cal_known if lo <= r["sent_prob"] < hi]
+        rows = [r for r in cal_settled if lo <= r["sent_prob"] < hi]
         w, l = _wl(rows)
         if w + l:
             avg = sum(r["sent_prob"] for r in rows) / len(rows)
             print(f"  prob {lo*100:.0f}-{min(hi, 1.0)*100:.0f}%: n={w+l}  avg model {avg*100:.1f}%  actual {w/(w+l)*100:.1f}%")
+    if cal_unsettled:
+        print(f"  sent but unsettled (excluded from calibration): n={len(cal_unsettled)}")
+    if cal_push:
+        print(f"  sent but pushed (excluded from calibration): n={len(cal_push)}")
     if cal_unknown:
         w, l = _wl(cal_unknown)
         if w + l:
             print(f"  sent_prob unknown (old data, excluded from calibration mean): n={w+l}  {w}W-{l}L")
+        _other = len(cal_unknown) - (w + l)
+        if _other:
+            print(f"  sent_prob unknown, not settled (excluded from calibration): n={_other}")
     print("=== user bets ===")
     if bets:
         w, l = _wl(bets)
