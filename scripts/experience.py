@@ -301,23 +301,44 @@ def stats():
     w, l = _wl(formal)
     if w + l:
         print(f"formal pushes delivered: {w}W-{l}L  hit {w/(w+l)*100:.1f}%  (n={w+l})")
+    # (F) Kind breakdown is formal (actually sent) only: the old code
+    # mixed detected-not-sent records into the same rows, so a sent
+    # hit win + a detected-only hit loss printed as hit 1W-1L while
+    # the formal total correctly said 1W-0L. Detected records are
+    # shown separately, explicitly labelled not-sent.
     for kind in ("hit", "leak", "leak_plus", "trigger", "attach", "missed"):
-        rows = [r for r in pushes if r.get("kind") == kind]
+        rows = [r for r in formal if r.get("kind") == kind]
         w, l = _wl(rows)
         if w + l:
-            print(f"  kind={kind}: {w}W-{l}L  hit {w/(w+l)*100:.1f}%  (n={w+l})")
+            print(f"  kind={kind} (sent): {w}W-{l}L  hit {w/(w+l)*100:.1f}%  (n={w+l})")
+    for kind in ("hit", "leak", "leak_plus", "trigger", "attach", "missed"):
+        rows = [r for r in detected if r.get("kind") == kind]
+        w, l = _wl(rows)
+        if w + l:
+            print(f"  kind={kind} (detected-not-sent, never a push): {w}W-{l}L  (n={w+l})")
     for mkt in ("ml", "spread", "total"):
         rows = [r for r in formal if r.get("market") == mkt]
         w, l = _wl(rows)
         if w + l:
             print(f"  market={mkt}: {w}W-{l}L  hit {w/(w+l)*100:.1f}%  (n={w+l})")
-    print("calibration (model prob vs actual, formal delivered only):")
+    # (F) Calibration uses the SEND-time probability (sent_prob),
+    # not the detection-time prob: a line detected at 99% but sent
+    # at 96% must calibrate as 96%. Formal records without sent_prob
+    # (old data) are counted separately and never silently borrow
+    # the detected prob into the calibration mean.
+    print("calibration (send-time prob vs actual, formal delivered only):")
+    cal_known = [r for r in formal if r.get("sent_prob") is not None]
+    cal_unknown = [r for r in formal if r.get("sent_prob") is None]
     for lo, hi in ((0.85, 0.90), (0.90, 0.95), (0.95, 1.01)):
-        rows = [r for r in formal if r.get("prob") is not None and lo <= r["prob"] < hi]
+        rows = [r for r in cal_known if lo <= r["sent_prob"] < hi]
         w, l = _wl(rows)
         if w + l:
-            avg = sum(r["prob"] for r in rows) / len(rows)
+            avg = sum(r["sent_prob"] for r in rows) / len(rows)
             print(f"  prob {lo*100:.0f}-{min(hi, 1.0)*100:.0f}%: n={w+l}  avg model {avg*100:.1f}%  actual {w/(w+l)*100:.1f}%")
+    if cal_unknown:
+        w, l = _wl(cal_unknown)
+        if w + l:
+            print(f"  sent_prob unknown (old data, excluded from calibration mean): n={w+l}  {w}W-{l}L")
     print("=== user bets ===")
     if bets:
         w, l = _wl(bets)
