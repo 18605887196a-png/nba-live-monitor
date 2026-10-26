@@ -67,6 +67,8 @@ REASON_TEXT = {
     "process_lead_narrowing": "近5分钟领先优势明显缩小，与候选方向相反",
     "probability_below_threshold": "模型概率已跌破推送门槛",
     "data_missing": "本轮行情缺失，无法确认原条件是否成立",
+    "inversion_no_longer_holds": "原倒挂已不再成立（较易线不再更便宜）",
+    "tracked_kind_unknown": "跟踪记录类型未知，无法按原条件复查",
     "process_blowout_tail": "大比分领先进入收尾，胜负与让分须分开看",
     "process_close_late": "比分接近进入末节，可能进入犯规阶段",
     "cost_unverifiable_target": "已设目标金额但订单簿不足，无法确认全额成本",
@@ -107,6 +109,10 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
     # absent from this round's book may simply be unlisted this poll.
     if candidate.get("data_status") == "missing":
         return _build(key, candidate, "REVIEW", ["data_missing"], ["market_data"], cost)
+    # Unknown tracked kind is REVIEW, not a silent fallback to hit
+    # rules and not a proven failure.
+    if candidate.get("data_status") == "unknown_kind":
+        return _build(key, candidate, "REVIEW", ["tracked_kind_unknown"], ["kind"], cost)
     # Tracked original condition: a reliable new probability below the
     # threshold at send time means the original push condition no
     # longer holds. This is INVALIDATED in the decision sense only;
@@ -123,6 +129,8 @@ def decide_candidate(candidate, game, process, market, cost, game_closed=False, 
         reasons.append("identity_mismatch")
     if candidate.get("base_condition_false"):
         reasons.append("base_condition_false")
+    if candidate.get("inversion_broken"):
+        reasons.append("inversion_no_longer_holds")
     if raw_price is None:
         reasons.append("price_missing")
         missing.append("buy_price")

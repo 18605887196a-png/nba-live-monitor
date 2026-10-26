@@ -93,3 +93,10 @@ launch 任务 └─ worker 赛前备参数（slug / home_margin / 总分主线 
 - **成本（F5）**：仅对已展示的总分候选接 Polymarket CLOB 订单簿（`book?token_id=`，官方文档口径），小分查小分 token、不拿 Over 订单簿代替；胜负/让分 token 映射未核实，成本仍写未知、不猜。目标金额是不含费买入金额，另报含费支出；费用未知时含费成本为 null；深度不足与请求失败分开（empty vs unknown）；总核价预算 5 秒，超时返回未知、不拖整轮。Polymarket 订单簿只是参考，不能表示已核实 Gate 实际成交成本。
 - **节点空播报（F6 口径如实说明）**：固定节点无够格主盘时，sender 仍发一句话状态版（如“【三节结束】…，暂无够格线”），这是节点保证，不是漏发；节点与主推同轮时节点分支先执行，风险顺延到下一轮用新快照复核（不丢弃、不发已恢复的旧告警）。
 
+## 69fbb1d 复查补丁（2026-10-26，POLICY_VERSION = "v1-20261026-fixes3"）
+
+- 风险文案支持报价缺失：胜负/让分跟踪线本轮行情缺失时，消息写“报价暂缺，暂无法核验”，不计算倍率/核价线，不把未知替成 0，不再因 ceil(None) 让 sender 退出。
+- kind 字段统一：register_tracked 同时写 `kind` 与 `original_kind`；复查读 `kind or original_kind`；类型仍缺失时判 REVIEW + `tracked_kind_unknown`，不默默按达标规则处理，风险也不按达标门槛发。
+- 倒挂失效有具体理由：总分/受让捡漏比较线证明不再更便宜时，判 INVALIDATED + `inversion_no_longer_holds`（同时保留 `base_condition_false`）。
+- 总分捡漏不套距线：距线 ≥10 分只对总分 hit 检查，leak 不检查；69fbb1d 已写入的旧 leak 记录（min_margin=10、只有 original_kind）按类型重新解释，不用迁移文件，快照不变不再报失效。
+

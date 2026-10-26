@@ -82,6 +82,8 @@ def mult(price_c):
     return 100.0 / price_c if price_c else 0.0
 
 def ceil(price_c):
+    if price_c is None:
+        return None
     return min(price_c + 5, 100)
 
 def parse_price_prob(text):
@@ -164,6 +166,19 @@ def fmt_main(key, info, is_conclusion, ot):
     is_leak = kind in ("leak", "leak_plus")
     mark = "【倒挂】" if is_leak else ""
     note = vs_note(text) if is_leak else None
+    # Issue 1 fix: a risk message for a tracked line whose book is
+    # missing this round has price=None. It must render as "报价暂缺",
+    # never crash in ceil()/mult(), and never substitute 0 for unknown.
+    if price is None:
+        _prob_part = f"，模型 {prob:.0f}%" if prob is not None else ""
+        if market == "ml":
+            return f"{mark}{cn(pick)}胜负，报价暂缺，暂无法核验{_prob_part}"
+        if market == "total":
+            _dcn = "大分" if pick == "Over" else "小分"
+            return f"{mark}{_dcn} {line:g}，报价暂缺，暂无法核验{_prob_part}"
+        if market == "spread":
+            return f"{mark}{cn(pick)} {line:+.1f}，报价暂缺，暂无法核验{_prob_part}"
+        return text
     if market == "ml":
         body = f"{cn(pick)}胜负 @ {ptxt}，{probtxt}，核价线 {ceil(price):.0f}¢"
         return f"{mark}{body}" if not is_conclusion else f"买{body}"
@@ -193,6 +208,8 @@ def fmt_main(key, info, is_conclusion, ot):
 def fmt_spread_attach(key, info):
     _, _, pick, line = key
     price, prob = info["price"], info["prob"]
+    if price is None or prob is None:
+        return f"{cn(pick)} {line:+.1f}（报价暂缺，暂无法核验）"
     return f"{cn(pick)} {line:+.1f} @ {price:.0f}¢ 覆盖 {prob:.0f}%"
 
 def parse_output(out):
@@ -350,11 +367,19 @@ def register_tracked(tracked, event_id, keys, structured):
             "condition_id": _ident.get("condition_id"), "asset_id": _asset,
             "market": _mkt, "pick": _pick, "line": _line,
             "rules_key": f"{_mkt}|{_pick}|{_line}",
+            # kind is the field _eval_tracked reads; original_kind is
+            # kept for backward compatibility. A record without kind
+            # used to be read as kind=None and silently evaluated
+            # under the wrong (hit) rules.
+            "kind": _kind,
             "original_kind": _kind,
             "policy_version_at_send": (structured.get("policy_version") if isinstance(structured, dict) else None),
             "threshold_at_send": LEAK_PROB if _kind in ("leak", "leak_plus") else HIT_PROB,
+            # Original conditions must match the original entry rule:
+            # a totals HIT requires >=10 margin; a totals LEAK never
+            # had a margin requirement, so it must not carry one.
             "original_conditions": {"threshold": LEAK_PROB if _kind in ("leak", "leak_plus") else HIT_PROB,
-                                    "min_margin": 10 if _mkt == "total" else None,
+                                    "min_margin": 10 if (_mkt == "total" and _kind == "hit") else None,
                                     "leak_vs": _sc.get("leak_vs")},
             "leak_vs": _sc.get("leak_vs"),
             "sent_at": time.time(), "last_state": "WATCH", "last_reason_codes": [],
@@ -785,6 +810,9 @@ def main():
                     _tdec = _tev.get("decision") or {}
                     _tstate = _tdec.get("state")
                     _treasons = _tdec.get("reason_codes") or []
+                    if "tracked_kind_unknown" in _treasons:
+                        log_msg(a.log, f"RISK held (tracked, unknown kind) {_sid} {_tstate} reasons={','.join(_treasons)}")
+                        continue
                     if _tstate == "WATCH" and _entry.get("last_state") in ("REVIEW", "INVALIDATED"):
                         _entry["episode"] = int(_entry.get("episode") or 1) + 1
                         _entry["last_state"] = "WATCH"

@@ -302,13 +302,40 @@ def analyze(gid, slug, hm, state):
     tracked_evaluations = []
     def _eval_tracked(sig):
         try:
-            _mkt, _pick, _ln, _kind = sig.get("market"), sig.get("pick"), sig.get("line"), sig.get("kind")
+            _mkt, _pick, _ln = sig.get("market"), sig.get("pick"), sig.get("line")
+            # Kind must be read from the field register_tracked actually
+            # writes. 69fbb1d records only carry original_kind; reading
+            # kind alone yielded None and silently evaluated leaks
+            # under hit rules (and hit thresholds in risk gating).
+            _kind = sig.get("kind") or sig.get("original_kind")
             _thresh = sig.get("threshold_at_send")
             if _thresh is None:
                 _thresh = LEAK_PROB if _kind in ("leak", "leak_plus") else HIT_PROB
             _base_false = False
+            _inversion_broken = False
             _prob = None; _price = None; _bid = None; _ask = None; _data_status = "ok"
             _vs = sig.get("leak_vs") or {}
+            if _kind is None:
+                _dec0 = None
+                if _NEW_MODULES:
+                    try:
+                        _dec0 = decide_candidate(
+                            {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
+                             "kind": None, "raw_prob": None, "raw_price": None,
+                             "data_status": "unknown_kind"},
+                            {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
+                             "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
+                             "home_abbr": hab, "away_abbr": aab},
+                            process, None, None)
+                    except Exception as _e:
+                        _dec0 = {"state": "REVIEW", "reason_codes": ["tracked_kind_unknown"],
+                                 "reasons_text": [f"复查异常：{type(_e).__name__}"]}
+                return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
+                        "kind": None, "threshold_at_send": float(_thresh) if _thresh is not None else None,
+                        "raw_prob": None, "raw_price": None, "bid": None, "ask": None,
+                        "data_status": "unknown_kind", "base_condition_false": False,
+                        "inversion_broken": False, "decision": _dec0,
+                        "evaluated_epoch": time.time()}
             if _mkt == "ml" and ml and sd_m:
                 _is_home = (_pick == hab) or (team_names and len(team_names) == 2 and _pick == team_names[1])
                 _is_away = (_pick == aab) or (team_names and len(team_names) == 2 and _pick == team_names[0])
@@ -334,7 +361,10 @@ def analyze(gid, slug, hm, state):
                         _p2 = Phi((_mean2 + float(_ot_ln)) / sd_m) if sd_m else 0.5
                         _prob, _price, _bid, _ask = 1 - _p2, 1 - _b2, 1 - _a2, 1 - _b2
                         _ml_a = ml[1] if _pick in (aab, team_names[0] if team_names else None) else 1 - ml[0]
-                        if not (_prob >= _thresh and _price <= _ml_a):
+                        if _prob < _thresh:
+                            _base_false = True
+                        elif _price > _ml_a:
+                            _inversion_broken = True
                             _base_false = True
                 else:
                     _found = None
@@ -357,12 +387,19 @@ def analyze(gid, slug, hm, state):
                     _p_over = Phi((mu - float(_ln)) / sd_t) if sd_t else 0.5
                     if _pick == "Over":
                         _prob, _price, _bid, _ask = _p_over, _a3, _b3, _a3
-                        if mu - float(_ln) < TOTALS_MIN_MARGIN:
+                        # Margin is a HIT entry rule only. A LEAK was
+                        # never required to be >=10 from the projection;
+                        # applying it in review invents "just pushed,
+                        # already invalid" alerts on unchanged snapshots.
+                        # Old 69fbb1d leak records that stored
+                        # min_margin=10 are therefore ignored here:
+                        # the kind, not the stored value, decides.
+                        if _kind == "hit" and mu - float(_ln) < TOTALS_MIN_MARGIN:
                             _base_false = True
                     elif _pick == "Under":
                         _ub3, _ua3 = normalize_under_quote(_b3, _a3) if _NEW_MODULES else (1 - _a3, 1 - _b3)
                         _prob, _price, _bid, _ask = 1 - _p_over, _ua3, _ub3, _ua3
-                        if float(_ln) - mu < TOTALS_MIN_MARGIN:
+                        if _kind == "hit" and float(_ln) - mu < TOTALS_MIN_MARGIN:
                             _base_false = True
                     else:
                         _data_status = "missing"
@@ -373,6 +410,7 @@ def analyze(gid, slug, hm, state):
                         else:
                             _cmp_ask = (1 - _cmp[0]) if _pick == "Under" else _cmp[1]
                             if not (_price < _cmp_ask - 0.005):
+                                _inversion_broken = True
                                 _base_false = True
             else:
                 _data_status = "missing"
@@ -383,6 +421,7 @@ def analyze(gid, slug, hm, state):
                         {"event_id": str(gid), "market": _mkt, "pick": _pick, "line": _ln,
                          "kind": _kind, "raw_prob": _prob, "raw_price": _price,
                          "tracked_threshold": float(_thresh), "base_condition_false": _base_false,
+                         "inversion_broken": _inversion_broken,
                          "data_status": _data_status if _data_status == "missing" else None},
                         {"home_score": hs, "away_score": as_, "period": per, "clock": clk,
                          "lead": lead, "tot": tot, "elapsed_min": elapsed, "remaining_min": t,
@@ -399,7 +438,8 @@ def analyze(gid, slug, hm, state):
             return {"signal_id": sig.get("signal_id"), "market": _mkt, "pick": _pick, "line": _ln,
                     "kind": _kind, "threshold_at_send": float(_thresh), "raw_prob": _prob,
                     "raw_price": _price, "bid": _bid, "ask": _ask, "data_status": _data_status,
-                    "base_condition_false": _base_false, "decision": _dec,
+                    "base_condition_false": _base_false, "inversion_broken": _inversion_broken,
+                    "decision": _dec,
                     "evaluated_epoch": time.time()}
         except Exception as _e:
             return {"signal_id": sig.get("signal_id"), "market": sig.get("market"), "pick": sig.get("pick"),
