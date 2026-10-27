@@ -28,6 +28,7 @@ try:
                                 trade_status_from_market, tradable_for_new)
     from decision import decide_candidate
     from policy_config import (POLICY_VERSION, MODEL_VERSION, HIT_PROB, LEAK_PROB,
+                               OVER_REVIEW_PROB,
                                Q4_HIT_LATE_REMAINING_MIN, Q4_HIT_BLOWOUT_LEAD,
                                TOTALS_MIN_ELAPSED_MIN, TOTALS_MIN_MARGIN,
                                OT_WARN_CLOSE_LEAD, OT_WARN_OT_PROB, OT_WARN_OT_CUSHION,
@@ -38,6 +39,7 @@ except Exception:
     trade_status_from_market = None
     tradable_for_new = lambda s: s in ("ok", "unknown")
     HIT_PROB, LEAK_PROB = 0.95, 0.90
+    OVER_REVIEW_PROB = 0.90
     Q4_HIT_LATE_REMAINING_MIN, Q4_HIT_BLOWOUT_LEAD = 5.0, 30
     TOTALS_MIN_ELAPSED_MIN, TOTALS_MIN_MARGIN = 15, 10
     OT_WARN_CLOSE_LEAD, OT_WARN_OT_PROB, OT_WARN_OT_CUSHION = 8, 0.03, 20
@@ -599,10 +601,11 @@ def analyze(gid, slug, hm, state):
         if not tradable_for_new(totals_status.get(ln, "unknown")):
             continue
         p_over = Phi((mu - ln) / sd_t)
-        # Overs-only Q4 start (user 2026-10-27): Over HITs ignore hit_ok,
-        # so they push from the start of Q4, not just the last 5:00.
-        # Under/ML HITs keep the hit_ok gate.
-        if totals_ok and p_over >= HIT_PROB and mu - ln >= TOTALS_MIN_MARGIN:
+        # Over review bar (user 2026-10-27): Over candidates at >= 0.90
+        # are handed to the main agent's secondary analysis (no hit_ok
+        # gate, no margin gate -- the analysis judges the margin).
+        # Under/ML HITs keep hit_ok + HIT_PROB + margin.
+        if totals_ok and p_over >= OVER_REVIEW_PROB:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
             _add_cand("total", "Over", ln, "hit", p_over, a, b, a, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})", totals_id.get(ln))
         _p_under = _under_prob(ln)

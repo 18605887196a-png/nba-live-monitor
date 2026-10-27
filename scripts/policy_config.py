@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261027-overs-only"  # Overs-only pushes (user 2026-10-27): only totals Over candidates push, from Q4 start (Over HITs ignore the last-5-min gate); ML/Under/spread computed but not pushed; rest = v1-20261027-over-priority
+POLICY_VERSION = "v1-20261027-over-analysis"  # Over analysis feed (user 2026-10-27): Over candidates >=0.90 handed to main-agent secondary analysis, no auto-push; sender/sweep/mirror retired; rest = v1-20261027-overs-only
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime for totals (user 2026-10-26 warning, user 2026-10-27 blend):
@@ -103,6 +103,7 @@ FEE_PER_SHARE_DEFAULT = None
 # live rules; only the source of truth moves here.
 HIT_PROB = 0.95
 LEAK_PROB = 0.90
+OVER_REVIEW_PROB = 0.90  # Over analysis feed (user 2026-10-27): Over candidates at/above this go to the main agent's secondary analysis; no auto-push.
 Q4_HIT_LATE_REMAINING_MIN = 5.0
 Q4_HIT_BLOWOUT_LEAD = 30
 TOTALS_MIN_ELAPSED_MIN = 15
