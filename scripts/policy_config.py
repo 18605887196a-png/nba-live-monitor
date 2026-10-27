@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261026-af-fixes"  # clock-missing -> data_error; explicit closed/paused markets block new pushes  # F1-F6: tracked review, Under quote fix, coverage-gated tags, scan_id
+POLICY_VERSION = "v1-20261027-quote-fill"  # missing-side quote fill from CLOB book (totals/ML/spread); incomplete_quote blocked visibility; rest = v1-20261026-af-fixes
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime warning for totals (user 2026-10-26, inferred by assistant):

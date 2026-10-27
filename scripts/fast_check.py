@@ -319,6 +319,78 @@ def analyze(gid, slug, hm, state):
             return "unknown"
         except Exception:
             return "unknown"
+    # (G) Missing-side quote fill (2026-10-27): gamma's market-level
+    # bestBid/bestAsk describe ONE side of a binary market. When that
+    # side is nearly dead (e.g. Over at 2c late in a game) its bid can
+    # be None, and the old _select dropped the whole line even though
+    # the other side is perfectly tradeable -- exactly when an Under
+    # lock is most certain. Fill a missing side from the CLOB book of
+    # the OTHER side via the binary complement (own bid = 1 - other
+    # ask, own ask = 1 - other bid), falling back to the own token's
+    # book. Every filled value comes from a live book quote; nothing
+    # is invented. If books also fail, the line stays dropped but is
+    # recorded in blocked_markets as incomplete_quote instead of
+    # vanishing silently.
+    _book_cache = {}
+    def _book_quote(_tok):
+        if not _tok or not _NEW_MODULES or fetch_book is None:
+            return None, None
+        if _tok in _book_cache:
+            return _book_cache[_tok]
+        try:
+            _asks, _bids = fetch_book(_tok)
+        except Exception:
+            _asks, _bids = None, None
+        _bb = _bids[0][0] if _bids else None
+        _ba = _asks[0][0] if _asks else None
+        _book_cache[_tok] = (_bb, _ba)
+        return _book_cache[_tok]
+    def _fill_from_books(_obj, _own_tok, _other_tok):
+        _b, _a = _obj.get("bid"), _obj.get("ask")
+        if _b is None and _other_tok:
+            _ob, _oa = _book_quote(_other_tok)
+            if _oa is not None:
+                _b = 1.0 - float(_oa)
+        if _a is None and _other_tok:
+            _ob, _oa = _book_quote(_other_tok)
+            if _ob is not None:
+                _a = 1.0 - float(_ob)
+        if (_b is None or _a is None) and _own_tok:
+            _ob, _oa = _book_quote(_own_tok)
+            if _b is None and _ob is not None:
+                _b = float(_ob)
+            if _a is None and _oa is not None:
+                _a = float(_oa)
+        return _b, _a
+    def _totals_fill(_obj):
+        _ident = _obj.get("identity")
+        if not _NEW_MODULES or token_for_total is None or not isinstance(_ident, dict):
+            return _obj.get("bid"), _obj.get("ask")
+        return _fill_from_books(_obj, token_for_total(_ident, "Over"),
+                                token_for_total(_ident, "Under"))
+    def _ml_fill(_obj):
+        _ident = _obj.get("identity")
+        if not _NEW_MODULES or not isinstance(_ident, dict):
+            return _obj.get("bid"), _obj.get("ask")
+        _toks = _ident.get("token_ids"); _outs = _ident.get("outcomes")
+        if (not isinstance(_toks, (list, tuple)) or len(_toks) < 2
+                or not isinstance(_outs, (list, tuple)) or len(_outs) < 2
+                or _outs[0] in ("Yes", "No") or _outs[1] in ("Yes", "No")):
+            return _obj.get("bid"), _obj.get("ask")
+        # market-level (bid, ask) is the FIRST-outcome side (away):
+        # the home pick is priced by complement (1 - bid), so the
+        # away quote is the own side and home is the other side.
+        return _fill_from_books(_obj, _toks[0], _toks[1])
+    def _spread_fill(_obj):
+        _ident = _obj.get("identity")
+        if not _NEW_MODULES or not isinstance(_ident, dict):
+            return _obj.get("bid"), _obj.get("ask")
+        _toks = _ident.get("token_ids"); _outs = _ident.get("outcomes")
+        if (not isinstance(_toks, (list, tuple)) or len(_toks) < 2
+                or list(_outs) != ["Yes", "No"]):
+            return _obj.get("bid"), _obj.get("ask")
+        # market-level (bid, ask) is the Yes side (tokens[0]).
+        return _fill_from_books(_obj, _toks[0], _toks[1])
     team_names = []
     for m in ev['markets']:
         q = m.get('question', ''); b = m.get('bestBid'); a = m.get('bestAsk'); ln = m.get('line')
@@ -336,8 +408,14 @@ def analyze(gid, slug, hm, state):
             if _c0:
                 ml_condition_set.add(_c0)
                 ml_trade_by_condition[_c0] = _st
-                if b is not None and a is not None:
-                    ml_by_condition[_c0] = (b, a)
+                _mb, _ma = b, a
+                if _mb is None or _ma is None:
+                    try:
+                        _mb, _ma = _ml_fill(ml_objs[-1])
+                    except Exception:
+                        pass
+                if _mb is not None and _ma is not None:
+                    ml_by_condition[_c0] = (_mb, _ma)
                     ml_identity_by_condition[_c0] = ml_objs[-1]["identity"]
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "ml", "status": _st})
@@ -367,19 +445,40 @@ def analyze(gid, slug, hm, state):
                 spreads_trade_by_condition.setdefault(_team0, {}).setdefault(ln, {})[_c2] = _st
             if _st in ("closed", "paused", "inactive"):
                 blocked_markets.append({"market": "spread", "pick": _team0, "line": ln, "status": _st})
-        if ln is None or b is None or a is None or b <= 0.01 or a >= 0.999:
+        _fb, _fa = b, a
+        _filled = False
+        if ln is not None and (_fb is None or _fa is None):
+            _is_tot = 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q'))
+            _is_spr = q.startswith('Spread:')
+            try:
+                if _is_tot and totals_objs.get(ln):
+                    _fb, _fa = _totals_fill(totals_objs[ln][-1])
+                    _filled = True
+                elif _is_spr:
+                    _team0 = q.replace('Spread: ', '').rsplit(' (', 1)[0]
+                    if spreads_objs.get(_team0, {}).get(ln):
+                        _fb, _fa = _spread_fill(spreads_objs[_team0][ln][-1])
+                        _filled = True
+            except Exception:
+                pass
+        _dust = 0 if _filled else 0.01
+        if ln is None or _fb is None or _fa is None or _fb <= _dust or _fa >= 0.999:
+            if ln is not None and (_fb is None or _fa is None):
+                _is_tot2 = 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q'))
+                if _is_tot2:
+                    blocked_markets.append({"market": "total", "line": ln, "status": "incomplete_quote"})
             continue
         if 'O/U' in q and 'vs.' in q and not any(x in q for x in ('1H', '1Q', '2Q', '3Q', '4Q')):
             _c1 = _cond_of(m)
             if _c1:
-                totals_by_condition.setdefault(ln, {})[_c1] = (b, a)
+                totals_by_condition.setdefault(ln, {})[_c1] = (_fb, _fa)
                 _tid = totals_objs[ln][-1]["identity"] if totals_objs.get(ln) else None
                 totals_identity_by_condition.setdefault(ln, {})[_c1] = _tid
         if q.startswith('Spread:'):
             team = q.replace('Spread: ', '').rsplit(' (', 1)[0]
             _c2 = _cond_of(m)
             if _c2:
-                spreads_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = (b, a)
+                spreads_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = (_fb, _fa)
                 _sid = spreads_objs[team][ln][-1]["identity"] if spreads_objs.get(team, {}).get(ln) else None
                 spreads_identity_by_condition.setdefault(team, {}).setdefault(ln, {})[_c2] = _sid
 
@@ -388,30 +487,49 @@ def analyze(gid, slug, hm, state):
     # can never lend its price to a tradable replacement (and a
     # tradable replacement can never lend its status to a closed price).
     _STATUS_RANK = {"ok": 0, "unknown": 1, "paused": 2, "inactive": 3, "closed": 4}
-    def _select(objs):
-        _valid = [o for o in objs if o["bid"] is not None and o["ask"] is not None
-                  and o["bid"] > 0.01 and o["ask"] < 0.999]
+    def _select(objs, fill=None):
+        _cands = []
+        for o in objs:
+            _b, _a = o["bid"], o["ask"]
+            _filled = False
+            if (_b is None or _a is None) and fill is not None:
+                try:
+                    _b, _a = fill(o)
+                    _filled = True
+                except Exception:
+                    pass
+            _cands.append((_b, _a, _filled, o))
+        _valid = [(b, a, o) for (b, a, f, o) in _cands
+                  if b is not None and a is not None
+                  and a < 0.999 and (b > 0.01 or (f and b > 0))]
         if not _valid:
             return None
-        return min(_valid, key=lambda o: (_STATUS_RANK.get(o["status"], 1), o["index"]))
-    _sel = _select(ml_objs)
+        _b, _a, _o = min(_valid, key=lambda t: (_STATUS_RANK.get(t[2]["status"], 1), t[2]["index"]))
+        return {"bid": _b, "ask": _a, "status": _o["status"], "identity": _o["identity"]}
+    _sel = _select(ml_objs, _ml_fill)
     if _sel is not None:
         ml = (_sel["bid"], _sel["ask"])
         ml_id = _sel["identity"]
         ml_status = _sel["status"]
+    elif ml_objs:
+        blocked_markets.append({"market": "ml", "status": "incomplete_quote"})
     for _ln, _objs in totals_objs.items():
-        _sel = _select(_objs)
+        _sel = _select(_objs, _totals_fill)
         if _sel is not None:
             totals[_ln] = (_sel["bid"], _sel["ask"])
             totals_id[_ln] = _sel["identity"]
             totals_status[_ln] = _sel["status"]
+        elif _objs:
+            blocked_markets.append({"market": "total", "line": _ln, "status": "incomplete_quote"})
     for _team, _lines in spreads_objs.items():
         for _ln, _objs in _lines.items():
-            _sel = _select(_objs)
+            _sel = _select(_objs, _spread_fill)
             if _sel is not None:
                 spreads.setdefault(_team, []).append((_ln, _sel["bid"], _sel["ask"]))
                 spreads_id.setdefault(_team, {})[_ln] = _sel["identity"]
                 spreads_status.setdefault(_team, {})[_ln] = _sel["status"]
+            elif _objs:
+                blocked_markets.append({"market": "spread", "pick": _team, "line": _ln, "status": "incomplete_quote"})
 
     hits, leaks = [], []
     # v1 structured candidates, built in parallel with the text lists
@@ -1006,6 +1124,16 @@ def analyze(gid, slug, hm, state):
     _shown_texts = set(leaks_sorted[:3]) | {h for _, h in shown}
     for _c in cands:
         _c["shown"] = _c["text"] in _shown_texts
+    # Dedupe blocked_markets: the same line can be flagged both while
+    # recording per-condition prices and while selecting candidates.
+    _seen_blocked = set()
+    _deduped_blocked = []
+    for _bm in blocked_markets:
+        _bk = (_bm.get("market"), _bm.get("pick"), _bm.get("line"), _bm.get("status"))
+        if _bk not in _seen_blocked:
+            _seen_blocked.add(_bk)
+            _deduped_blocked.append(_bm)
+    blocked_markets = _deduped_blocked
     # Structured sidecar for the sender (bypass: text remains the push path).
     _out_path = os.environ.get("FC_STRUCTURED_OUT")
     if _out_path:
