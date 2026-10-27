@@ -863,10 +863,10 @@ def main():
                             pass
                         continue
                     _alert_key = f"{_cbase}|{_state_r}|{','.join(sorted(_reasons))}"
-                    _state_cn = "需复核" if _state_r == "REVIEW" else "原条件失效"
+                    _state_cn = "待确认" if _state_r == "REVIEW" else "条件已变"
                     _reason_txt = "；".join(_dec.get("reasons_text") or _reasons)
                     _risk_msg = (f"{state_line(state)}\n\n风险更新：{fmt_main(_skey, {'price': _c.get('raw_price') * 100 if _c.get('raw_price') is not None else None, 'prob': (_c.get('raw_prob') * 100 if _c.get('raw_prob') is not None else None), 'text': _c.get('text', '')}, False, state['ot'])}\n"
-                                 f"状态：{_state_cn}｜原因：{_reason_txt}\n说明：先前条件已变化，仅作提醒，不是卖出指令")
+                                 f"状态：{_state_cn}｜原因：{_reason_txt}\n说明：只是提醒你条件变了，不是让你卖出")
                     if a.dry_run:
                         log_msg(a.log, "DRY-RUN risk would send:\n" + _risk_msg)
                         risk_alerts[_alert_key] = time.time()
@@ -930,10 +930,10 @@ def main():
                     if _talert in risk_alerts:
                         continue
                     _tkey = (_tev.get("kind"), _tev.get("market"), _tev.get("pick"), _tev.get("line"))
-                    _tcn = "需复核" if _tstate == "REVIEW" else "原条件失效"
+                    _tcn = "待确认" if _tstate == "REVIEW" else "条件已变"
                     _trtxt = "；".join(_tdec.get("reasons_text") or _treasons)
                     _tmsg = (f"{state_line(state)}\n\n风险更新：{fmt_main(_tkey, {'price': _tev.get('raw_price') * 100 if _tev.get('raw_price') is not None else None, 'prob': (_tev.get('raw_prob') * 100 if _tev.get('raw_prob') is not None else None), 'text': ''}, False, state['ot'])}\n"
-                             f"状态：{_tcn}｜原因：{_trtxt}\n说明：先前条件已变化，仅作提醒，不是卖出指令")
+                             f"状态：{_tcn}｜原因：{_trtxt}\n说明：只是提醒你条件变了，不是让你卖出")
                     if a.dry_run:
                         log_msg(a.log, "DRY-RUN tracked risk would send:\n" + _tmsg)
                         risk_alerts[_talert] = time.time()

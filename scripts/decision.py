@@ -56,25 +56,25 @@ except Exception:  # pragma: no cover
 
 REASON_TEXT = {
     "identity_mismatch": "合约身份不匹配（换线/换合约，不能按原合约算涨跌）",
-    "base_condition_false": "基础条件在结构化数据里已不成立",
+    "base_condition_false": "当初的条件已经不成立了",
     "market_closed": "该市场已停止交易",
     "price_missing": "当前买价缺失，无法核价",
     "quote_stale": "快照接收时间过久，可能已过期",
     "quote_age_unknown": "行情来源时间未知，只能按接收时间判断",
-    "market_move_no_score": "盘口在比分未变时明显移动，需复核",
+    "market_move_no_score": "比分没变，但盘口明显动了，得再确认一下",
     "spread_widening": "买卖价差明显扩大，流动性异常",
     "last_only_move": "只有旧成交价跳动，当前买卖报价未确认",
     "process_lead_narrowing": "近5分钟领先优势明显缩小，与候选方向相反",
     "identity_mismatch": "原合约身份不符，无法按原合约复查",
     "identity_unknown": "旧记录无合约身份，无法核实原合约",
     "probability_below_threshold": "模型概率已跌破推送门槛",
-    "data_missing": "本轮行情缺失，无法确认原条件是否成立",
-    "inversion_no_longer_holds": "原倒挂已不再成立（较易线不再更便宜）",
+    "data_missing": "这轮盘口报价暂时没有，没法确认当初的条件还成不成立",
+    "inversion_no_longer_holds": "当初的倒挂已经没了，便宜的那条线不再更便宜",
     "tracked_kind_unknown": "跟踪记录类型未知，无法按原条件复查",
     "clock_unknown": "时钟缺失，暂无法核验",
     "score_unknown": "比分缺失，暂无法核验",
     "market_paused": "市场暂停交易，暂不可交易",
-    "comparison_market_closed": "比较市场已关闭/暂停，无法核验倒挂关系",
+    "comparison_market_closed": "用来比价的那个市场关了，没法再核对倒挂",
     "process_blowout_tail": "大比分领先进入收尾，胜负与让分须分开看",
     "process_close_late": "比分接近进入末节，可能进入犯规阶段",
     "cost_unverifiable_target": "已设目标金额但订单簿不足，无法确认全额成本",
@@ -372,9 +372,9 @@ def format_context_block(game, process, market_for_top, decision):
             )
         else:
             lines.append("当前成本：未核实（无目标金额、订单簿或渠道费用，核价线只是价格容忍，不是盈利安全线）")
-        state_cn = {"WATCH": "观察", "REVIEW": "需复核", "INVALIDATED": "原条件失效", "CLOSED": "已结束"}.get(decision.get("state"), decision.get("state"))
+        state_cn = {"WATCH": "观察", "REVIEW": "待确认", "INVALIDATED": "条件已变", "CLOSED": "已结束"}.get(decision.get("state"), decision.get("state"))
         reason_txt = "；".join(decision.get("reasons_text") or []) or "无冲突"
         lines.append(f"状态：{state_cn}｜原因：{reason_txt}")
         if decision.get("state") == "INVALIDATED":
-            lines.append("说明：原条件失效不等于必输，不触发自动卖出，仅作提醒")
+            lines.append("说明：只是提醒你条件变了，不是让你卖出")
     return "\n".join(lines)

@@ -13,15 +13,24 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261027-quote-fill"  # missing-side quote fill from CLOB book (totals/ML/spread); incomplete_quote blocked visibility; rest = v1-20261026-af-fixes
+POLICY_VERSION = "v1-20261027-ot-blend"  # OT-blended Under probability in close Q4/OT (user 2026-10-27, min-cle lesson); 30s OT-prob floor; rest = v1-20261027-quote-fill
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
-# Overtime warning for totals (user 2026-10-26, inferred by assistant):
-# Totals projections are REGULATION-only; the printed OT % alone does
-# not adjust them. A totals push still goes out (push + warning, never
-# blocked by this), but an Under push gets an explicit warning when the
-# game is close in Q4/OT and one OT at the current pace would eat most
-# of its cushion. Over pushes need no warning: OT only helps Over.
+# Overtime for totals (user 2026-10-26 warning, user 2026-10-27 blend):
+# Totals projections are REGULATION-only at the base, but an Under
+# probability in a close Q4/OT game must COUNT overtime, not just warn
+# about it: min-cle 2026-10-27 ended regulation 113:113 at 226 points,
+# OT added 26, final 252, busting the 232.5-236.5 Unders that the
+# regulation-only number had called safe. So for Under candidates with
+# period >= 4 and abs(lead) <= 8, the model probability is the mixture
+# (1-ot) * P_reg(Under) + ot * P_ot(Under), where the OT branch centers
+# on regulation proj + current pace * 5 minutes with the horizon-scaled
+# sd. Over is untouched: OT only helps Over, so regulation-only stays
+# the conservative number there. The OT warning text still attaches
+# alongside (it shows the OT-scenario total); it no longer carries the
+# whole OT adjustment alone. OT probability itself uses the same normal
+# model with sd floored at its 30s value, so a tied game in the final
+# 30s does not degenerate to 0% OT.
 #  - close: abs(lead) <= 8 in period >= 4 (OT included)
 #  - OT scenario total = regulation proj + current pace * 5 minutes
 #  - warn when OT prob >= 3% OR OT-scenario cushion < 20 points

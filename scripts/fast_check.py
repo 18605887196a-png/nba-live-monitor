@@ -254,11 +254,31 @@ def analyze(gid, slug, hm, state):
     # OT probability (same normal model as below) + OT-scenario total.
     # Totals projections are regulation-only, so a close Q4 Under push
     # needs an explicit OT warning (user 2026-10-26, push + warning, no block).
-    ot = 0.0
-    if sd_m:
-        _mean_m_home = lead + hm * t / 48
-        ot = Phi((0.5 - _mean_m_home) / sd_m) - Phi((-0.5 - _mean_m_home) / sd_m)
+    # OT sd is floored at its 30s value: without the floor a tied game
+    # in the final 30s degenerates to sd_m = 0 and 0% OT, exactly when
+    # OT is most likely (user 2026-10-27: close games must count OT).
+    _mean_m_home = lead + hm * t / 48
+    _sd_ot_prob = sd_m if sd_m else 13 * math.sqrt(0.5 / 48)
+    ot = Phi((0.5 - _mean_m_home) / _sd_ot_prob) - Phi((-0.5 - _mean_m_home) / _sd_ot_prob)
     ot_scenario = mu + pace * 5.0 if per >= 4 else None
+
+    def _under_prob(line):
+        # OT-blended Under probability (user 2026-10-27): in a close
+        # Q4/OT game the regulation-only number overstates an Under,
+        # because a tied game can run to OT and OT points bust lines
+        # that look safe in regulation (min-cle 2026-10-27: regulation
+        # 226, OT added 26, final 252, busting the 232.5-236.5 Unders).
+        # Mixture: with prob (1-ot) the game ends in regulation around
+        # mu, with prob ot it runs one more OT around ot_scenario.
+        # Over is untouched: OT only helps Over, so regulation-only
+        # stays the conservative number there. Outside close games
+        # the blend is identical to regulation-only (ot ~ 0 or gated).
+        p_reg = 1 - Phi((mu - line) / sd_t) if sd_t else 0.5
+        if per < 4 or abs(lead) > OT_WARN_CLOSE_LEAD or ot <= 0 or ot_scenario is None:
+            return p_reg
+        sd_ot = min(2.0 * math.sqrt(pace * (t + 5.0)), 21) if t + 5.0 > 0 else 1.0
+        p_ot = 1 - Phi((ot_scenario - line) / sd_ot) if sd_ot else 0.5
+        return (1 - ot) * p_reg + ot * p_ot
 
     def _ot_warning(line, pick):
         if pick != "Under" or ot_scenario is None or abs(lead) > OT_WARN_CLOSE_LEAD:
@@ -582,10 +602,11 @@ def analyze(gid, slug, hm, state):
         if hit_ok and totals_ok and p_over >= HIT_PROB and mu - ln >= TOTALS_MIN_MARGIN:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
             _add_cand("total", "Over", ln, "hit", p_over, a, b, a, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})", totals_id.get(ln))
-        if hit_ok and totals_ok and 1 - p_over >= HIT_PROB and ln - mu >= TOTALS_MIN_MARGIN:
+        _p_under = _under_prob(ln)
+        if hit_ok and totals_ok and _p_under >= HIT_PROB and ln - mu >= TOTALS_MIN_MARGIN:
             _ub, _ua = normalize_under_quote(b, a) if _NEW_MODULES else (1 - a, 1 - b)
-            hits.append((1 - p_over, f"Total Under {ln} ask {fmt_price(_ua)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
-            _add_cand("total", "Under", ln, "hit", 1 - p_over, _ua, _ub, _ua, f"Total Under {ln} ask {fmt_price(_ua)} prob {(1-p_over)*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})", totals_id.get(ln), ot_warning=_ot_warning(ln, "Under"))
+            hits.append((_p_under, f"Total Under {ln} ask {fmt_price(_ua)} prob {_p_under*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})"))
+            _add_cand("total", "Under", ln, "hit", _p_under, _ua, _ub, _ua, f"Total Under {ln} ask {fmt_price(_ua)} prob {_p_under*100:.0f}% (now {tot:.0f}, cushion {ln-tot:.0f}, proj {mu:.0f})", totals_id.get(ln), ot_warning=_ot_warning(ln, "Under"))
     ls = sorted(totals)
     for i in range(len(ls) - 1):
         l1, l2 = ls[i], ls[i + 1]
@@ -594,7 +615,7 @@ def analyze(gid, slug, hm, state):
         ua1, ua2 = 1 - totals[l1][0], 1 - totals[l2][0]
         oa1, oa2 = totals[l1][1], totals[l2][1]
         if ua2 < ua1 - 0.005:
-            p = 1 - Phi((mu - l2) / sd_t)
+            p = _under_prob(l2)
             if totals_ok and p >= LEAK_PROB:
                 leaks.append(f"LEAK Under {l2} ask {fmt_price(ua2)} vs Under {l1} {fmt_price(ua1)}: easier+cheaper by {100*(ua1-ua2):.0f}c, prob {p*100:.0f}% (now {tot:.0f}, cushion {l2-tot:.0f}, proj {mu:.0f})")
                 _ub2, _ua2 = normalize_under_quote(totals[l2][0], totals[l2][1]) if _NEW_MODULES else (1 - totals[l2][1], ua2)
@@ -618,10 +639,11 @@ def analyze(gid, slug, hm, state):
                     _add_cand("spread", team, ln2, "leak", p, a2, b2, a2, f"LEAK Spread {team} ({ln2:+.1f}) ask {fmt_price(a2)} vs ({ln1:+.1f}) {fmt_price(a1)}: easier+cheaper by {100*(a1-a2):.0f}c, cover {p*100:.0f}%", spreads_id.get(team, {}).get(ln2))
 
     # OT probability (user, 2026-10-24): P(final margin lands on 0) under the same normal model.
-    ot = 0.0
-    if sd_m:
-        mean_m_home = lead + hm * t / 48
-        ot = Phi((0.5 - mean_m_home) / sd_m) - Phi((-0.5 - mean_m_home) / sd_m)
+    # sd floored at its 30s value, same as the candidate-side computation:
+    # a tied game in the final 30s must not print 0% OT (user 2026-10-27).
+    mean_m_home = lead + hm * t / 48
+    _sd_ot_prob2 = sd_m if sd_m else 13 * math.sqrt(0.5 / 48)
+    ot = Phi((0.5 - mean_m_home) / _sd_ot_prob2) - Phi((-0.5 - mean_m_home) / _sd_ot_prob2)
     out = [f"{aab} {as_} @ {hab} {hs} | Q{per} {clk} | WP {aab} {(1-wp_home)*100:.0f}% / {hab} {wp_home*100:.0f}% | proj total {mu:.0f} | OT {ot*100:.0f}%"]
     # Priority (user, 2026-10-24 12:10 + 12:15): qualified inversions first,
     # then ML/totals hits, spreads always last (late-game margin is the least stable).
@@ -947,7 +969,7 @@ def analyze(gid, slug, hm, state):
                             _base_false = True
                     elif _pick == "Under":
                         _ub3, _ua3 = normalize_under_quote(_b3, _a3) if _NEW_MODULES else (1 - _a3, 1 - _b3)
-                        _prob, _price, _bid, _ask = 1 - _p_over, _ua3, _ub3, _ua3
+                        _prob, _price, _bid, _ask = _under_prob(float(_ln)), _ua3, _ub3, _ua3
                         if _kind == "hit" and float(_ln) - mu < TOTALS_MIN_MARGIN:
                             _base_false = True
                     else:
