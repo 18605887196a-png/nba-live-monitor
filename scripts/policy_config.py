@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261027-over-priority"  # Over-priority (user 2026-10-27): totals Over at 95%+ headlines the push, rest keep order; rest = v1-20261027-important-only
+POLICY_VERSION = "v1-20261027-overs-only"  # Overs-only pushes (user 2026-10-27): only totals Over candidates push, from Q4 start (Over HITs ignore the last-5-min gate); ML/Under/spread computed but not pushed; rest = v1-20261027-over-priority
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime for totals (user 2026-10-26 warning, user 2026-10-27 blend):

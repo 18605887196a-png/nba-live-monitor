@@ -599,7 +599,10 @@ def analyze(gid, slug, hm, state):
         if not tradable_for_new(totals_status.get(ln, "unknown")):
             continue
         p_over = Phi((mu - ln) / sd_t)
-        if hit_ok and totals_ok and p_over >= HIT_PROB and mu - ln >= TOTALS_MIN_MARGIN:
+        # Overs-only Q4 start (user 2026-10-27): Over HITs ignore hit_ok,
+        # so they push from the start of Q4, not just the last 5:00.
+        # Under/ML HITs keep the hit_ok gate.
+        if totals_ok and p_over >= HIT_PROB and mu - ln >= TOTALS_MIN_MARGIN:
             hits.append((p_over, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})"))
             _add_cand("total", "Over", ln, "hit", p_over, a, b, a, f"Total Over {ln} ask {fmt_price(a)} prob {p_over*100:.0f}% (now {tot:.0f}, need {ln-tot:.0f} more, proj {mu:.0f})", totals_id.get(ln))
         _p_under = _under_prob(ln)

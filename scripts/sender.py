@@ -259,9 +259,9 @@ def parse_output(out):
             continue
         seen.add(sig)
         items.append((k, info))
-    # Over-priority (user 2026-10-27): a totals Over candidate at 95%+
-    # becomes the headline conclusion, ahead of leaks/hits/Unders; the
-    # rest keep their original order and still ship as 另有/附带.
+    # Over ordering (user 2026-10-27): totals Over candidates at 95%+
+    # sort first (headline order among multiple Overs). Non-Over
+    # candidates never reach compose under Overs-only pushes.
     _is_prio_over = lambda k, i: (k[1] == "total" and k[2] == "Over"
                                   and i.get("prob") is not None and i["prob"] >= 95)
     items = ([(k, i) for k, i in items if _is_prio_over(k, i)]
@@ -284,7 +284,16 @@ def state_line(state):
         c = f"{clk} 秒"
     return f"{cn(aab)} {as_}:{hs} {cn(hab)}，{q}剩 {c}，共 {tot} 分，预测全场 {proj} 分"
 
+def _is_over_push(k):
+    """Overs-only pushes (user 2026-10-27): only a totals Over candidate
+    is sendable; ML/Under/spread are still computed but never pushed."""
+    return k[1] == "total" and k[2] == "Over"
+
+
 def compose(state, newly_main, newly_spread, prefix=""):
+    # newly_spread is accepted but currently not rendered: spreads are
+    # paused (user 2026-10-27), and Overs-only means no other market
+    # reaches compose as an attachment either.
     ot = state["ot"]
     parts = [f"{prefix}{state_line(state)}"]
     concl_key, concl_info = newly_main[0]
@@ -294,8 +303,6 @@ def compose(state, newly_main, newly_spread, prefix=""):
         rest.append(fmt_main(k, info, False, ot))
     if rest:
         parts.append("另有 " + "；".join(rest))
-    if newly_spread:
-        parts.append("附带 " + "；".join(fmt_spread_attach(k, info) for k, info in newly_spread))
     return "\n\n".join(parts)
 
 def clock_secs(clk):
@@ -635,8 +642,10 @@ def main():
             return f"{k[1]}|{k[2]}|{k[3]}"
         cur = set(sig_of(k) for k, _ in items)
         newly = [(k, info) for k, info in items if sig_of(k) not in prev]
-        # Spread lines (any kind) are attach-only, never triggers
+        # Spread lines (any kind) are never triggers
         # (user 2026-10-25: spread leaks demoted - late leads collapse systematically).
+        # Overs-only (user 2026-10-27): spreads are not pushed at all for now;
+        # the newly_spread computation is kept so re-enabling is trivial.
         newly_main = [(k, i) for k, i in newly if k[1] != "spread"]
         newly_spread = [(k, i) for k, i in newly if k[1] == "spread"]
         # Fixed nodes (minimum guarantee: every game gets a Q3-end broadcast
@@ -665,8 +674,9 @@ def main():
             node_kind = "q4"
         if node_kind:
             label = "【三节结束】" if node_kind == "q3" else "【Q4剩6分钟】"
-            main_all = [(k, i) for k, i in items if k[1] != "spread"]
-            spread_all = [(k, i) for k, i in items if k[1] == "spread"]
+            # Overs-only (user 2026-10-27): nodes carry Over conclusions only.
+            main_all = [(k, i) for k, i in items if _is_over_push(k)]
+            spread_all = []
             if main_all:
                 node_msg = compose(state, main_all, spread_all, prefix=label)
                 _otw = ot_warnings(structured, [k for k, _ in main_all])
@@ -746,12 +756,15 @@ def main():
         # Confirmation + gate (user 2026-10-25: fewer, more valuable sends).
         # Leaks send immediately; regular hits need 2 consecutive polls;
         # Q1/Q2 regular hits never send (early gate, already live).
+        # Overs-only (user 2026-10-27): confirmation tracks Over candidates only.
         _confirmed = [(k, i) for k, i in items
                       if sig_of(k) in pending and sig_of(k) in cur
-                      and k[1] != "spread"]
-        _new_leaks = [(k, i) for k, i in newly_main if k[0] in ("leak", "leak_plus")]
+                      and _is_over_push(k)]
+        _new_leaks = [(k, i) for k, i in newly_main
+                      if k[0] in ("leak", "leak_plus") and _is_over_push(k)]
         _new_hits = [(k, i) for k, i in newly_main
-                     if k[0] not in ("leak", "leak_plus") and sig_of(k) not in pending]
+                     if k[0] not in ("leak", "leak_plus") and sig_of(k) not in pending
+                     and _is_over_push(k)]
         if per <= 2:
             if not _new_leaks:
                 log_msg(a.log, f"GATED early Q{per} newly={len(newly_main)} logged-only")
@@ -766,7 +779,7 @@ def main():
             _send_spread = []
         else:
             _send_main = _new_leaks + _confirmed
-            _send_spread = newly_spread
+            _send_spread = []  # Overs-only: no spread attachments (user 2026-10-27)
         _pending_after = set(sig_of(k) for k, _ in _new_hits) if per >= 3 else set()
         if _send_main:
             msg = compose(state, _send_main, _send_spread)
