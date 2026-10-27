@@ -276,33 +276,19 @@ def _build(key, candidate, state, reasons, missing, cost):
 
 
 def risk_send_allowed(state, kind, raw_prob, game):
-    """Priority gate for risk updates (user 2026-10-26).
+    """Important-only gate for risk updates (user 2026-10-27).
 
-    Returns True only when the risk is worth sending, not just logging:
-    INVALIDATED always; REVIEW only in Q4/OT late (remaining <= 5 min)
-    or when raw_prob fell below its push threshold (hit 0.95, leak 0.90).
-    Early-game REVIEW (e.g. Q3, price repricing with prob/cutoff intact)
-    returns False: the caller logs it only and does not mark it sent.
-    game may be the structured game dict (period/remaining_min) or None;
-    with no game info, only INVALIDATED passes.
+    Returns True only for INVALIDATED: a line already pushed has actually
+    broken. REVIEW never sends anymore -- not in Q4 late, not on a
+    below-bar wobble: the caller logs it only (risk_updates + RISK held)
+    and does not mark it sent, so it can still fire if it later becomes
+    INVALIDATED. This replaces the 2026-10-26 priority gate (INVALIDATED
+    / Q4-late / below-bar), which still let through bursts of
+    near-identical foul-phase REVIEWs in the last minutes (mem-uta Q4
+    2026-10-27: 5 REVIEW sends in 5 minutes, 4 with the same reason).
+    Signature kept: kind/raw_prob/game are unused now, callers unchanged.
     """
-    if state == "INVALIDATED":
-        return True
-    if state != "REVIEW":
-        return False
-    if raw_prob is not None:
-        thresh = LEAK_PROB if kind in ("leak", "leak_plus") else HIT_PROB
-        if raw_prob < thresh:
-            return True
-    if isinstance(game, dict):
-        try:
-            per = int(game.get("period") or 0)
-            rem = float(game.get("remaining_min")) if game.get("remaining_min") is not None else None
-        except Exception:
-            per, rem = 0, None
-        if per >= 4 and rem is not None and rem <= RISK_SEND_LATE_REMAINING_MIN:
-            return True
-    return False
+    return state == "INVALIDATED"
 
 
 def should_send_risk(candidate_key, state, reasons, risk_alerts):

@@ -694,6 +694,22 @@ def main():
                 for k, _ in main_all + spread_all:
                     sent_at[sig_key(k)] = time.time()
                 save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
+            elif not main_all:
+                # Important-only (user 2026-10-27): a node with no main
+                # conclusion ("暂无够格线") is logged, not sent. Flags
+                # still advance so the node is not retried every round;
+                # sent_at is untouched (spread lines stay eligible as
+                # attachments to a later main push).
+                log_msg(a.log, f"NODE {node_kind} held (empty) main=0 spread={len(spread_all)}")
+                if node_kind == "q3":
+                    q3_node = True
+                    if 0 < clk_s <= 360:
+                        q4_node = True
+                else:
+                    q4_node = True
+                prev = cur
+                pending = set()
+                save_state(a.state, prev, q3_node, q4_node, per, pending, sent_at, risk_alerts, tracked)
             else:
                 ok = tg_send(node_msg, a.chat)
                 log_msg(a.log, f"NODE {node_kind} {'ok' if ok else 'FAILED'} main={len(main_all)} spread={len(spread_all)}")
