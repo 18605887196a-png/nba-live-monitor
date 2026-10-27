@@ -259,6 +259,13 @@ def parse_output(out):
             continue
         seen.add(sig)
         items.append((k, info))
+    # Over-priority (user 2026-10-27): a totals Over candidate at 95%+
+    # becomes the headline conclusion, ahead of leaks/hits/Unders; the
+    # rest keep their original order and still ship as 另有/附带.
+    _is_prio_over = lambda k, i: (k[1] == "total" and k[2] == "Over"
+                                  and i.get("prob") is not None and i["prob"] >= 95)
+    items = ([(k, i) for k, i in items if _is_prio_over(k, i)]
+             + [(k, i) for k, i in items if not _is_prio_over(k, i)])
     return "live", state, items
 
 def state_line(state):

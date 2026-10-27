@@ -13,7 +13,7 @@ block a push in bypass stage (see decision.py).
   explicitly uncalibrated, per the 2026-10-25 architecture document.
 """
 
-POLICY_VERSION = "v1-20261027-important-only"  # Important-only pushes (user 2026-10-27): empty nodes silent, risk sends INVALIDATED-only; rest = v1-20261027-ot-blend
+POLICY_VERSION = "v1-20261027-over-priority"  # Over-priority (user 2026-10-27): totals Over at 95%+ headlines the push, rest keep order; rest = v1-20261027-important-only
 MODEL_VERSION = "fast_check-20261025-wp-pace"
 
 # Overtime for totals (user 2026-10-26 warning, user 2026-10-27 blend):
